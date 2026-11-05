@@ -1,0 +1,59 @@
+# Identity used by darwin-vk to act as a node. Apply on the cluster with an admin kubeconfig.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: darwin-vk
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: darwin-vk
+rules:
+  - apiGroups: [""]
+    resources: [nodes, nodes/status]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list, watch, update, patch, delete]
+  - apiGroups: [""]
+    resources: [pods/status]
+    verbs: [get, update, patch]
+  - apiGroups: [""]
+    resources: [configmaps, secrets, services]
+    verbs: [get, list, watch]
+  - apiGroups: ["", events.k8s.io]
+    resources: [events]
+    verbs: [create, patch, update]
+  # Webhook authn/authz for the kubelet API (kubectl logs/exec).
+  - apiGroups: [authentication.k8s.io]
+    resources: [tokenreviews]
+    verbs: [create]
+  - apiGroups: [authorization.k8s.io]
+    resources: [subjectaccessreviews]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: darwin-vk
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: darwin-vk
+subjects:
+  - kind: ServiceAccount
+    name: darwin-vk
+    namespace: kube-system
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: darwin-vk-token
+  namespace: kube-system
+  annotations:
+    kubernetes.io/service-account.name: darwin-vk
+type: kubernetes.io/service-account-token
