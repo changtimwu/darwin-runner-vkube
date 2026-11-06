@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/creack/pty v1.1.24
+	github.com/google/go-containerregistry v0.21.6
 	github.com/prometheus/client_model v0.6.3
 	github.com/virtual-kubelet/virtual-kubelet v1.14.1
 	golang.org/x/sys v0.49.0
@@ -56,7 +57,6 @@ require (
 	github.com/google/cel-go v0.29.2 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
-	github.com/google/go-containerregistry v0.21.6 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/gorilla/mux v1.8.1 // indirect
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect

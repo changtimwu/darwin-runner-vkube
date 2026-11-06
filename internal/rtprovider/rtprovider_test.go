@@ -103,7 +103,7 @@ func TestPhase(t *testing.T) {
 			if tc.backoff {
 				bo = map[string]bool{"c": true}
 			}
-			got := toPodStatus(pod, st, "10.0.0.5", bo)
+			got := toPodStatus(pod, st, "10.0.0.5", bo, nil)
 			if got.Phase != tc.want {
 				t.Errorf("phase %s, want %s", got.Phase, tc.want)
 			}
@@ -112,7 +112,7 @@ func TestPhase(t *testing.T) {
 			}
 		})
 	}
-	if got := toPodStatus(testPod("", corev1.Container{Name: "c"}), nil, "ip", nil); got.Phase != corev1.PodPending ||
+	if got := toPodStatus(testPod("", corev1.Container{Name: "c"}), nil, "ip", nil, nil); got.Phase != corev1.PodPending ||
 		got.ContainerStatuses[0].State.Waiting.Reason != "ContainerCreating" {
 		t.Errorf("no runtime status: %+v", got)
 	}

@@ -24,6 +24,8 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/record"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/runtime"
@@ -45,7 +47,14 @@ type Config struct {
 	// DisableGPU withholds the GPU: the node advertises none and GPU pods are
 	// refused, even when the host has one.
 	DisableGPU bool
-	Logger     *slog.Logger
+	// Client reads imagePullSecrets. Nil pulls anonymously.
+	Client kubernetes.Interface
+	// InsecureRegistries are registry host[:port]s pulled over plain HTTP.
+	// Loopback and RFC 1918 addresses already are.
+	InsecureRegistries []string
+	// Events records pull events on pods. Nil records none.
+	Events record.EventRecorder
+	Logger *slog.Logger
 }
 
 // Provider implements nodeutil.Provider and node.PodNotifier on top of runtimed.
@@ -94,16 +103,17 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 			return nil, err
 		}
 	}
+	p := &Provider{cfg: cfg, log: cfg.Logger, pods: map[string]*tracked{}, served: make(chan struct{})}
 	rt, err := runtime.New(runtime.Config{
 		Root:           cfg.Root,
 		PodLogsDir:     cfg.PodLogsDir,
 		RuntimeVersion: "darwin-vk",
 		Logger:         cfg.Logger.With("component", "runtimed"),
-	}, runtime.Deps{})
+	}, p.deps())
 	if err != nil {
 		return nil, fmt.Errorf("start runtimed: %w", err)
 	}
-	p := &Provider{cfg: cfg, log: cfg.Logger, rt: rt, pods: map[string]*tracked{}, served: make(chan struct{})}
+	p.rt = rt
 	if info, err := rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{}); err == nil && !cfg.DisableGPU {
 		p.gpu = info.GetGpu()
 	}
@@ -130,6 +140,21 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 	}
 	p.client = runtimev1.NewRuntimeClient(p.conn)
 	return p, nil
+}
+
+func (p *Provider) deps() runtime.Deps {
+	d := runtime.Deps{ClusterRegistries: p.cfg.InsecureRegistries}
+	if p.cfg.Client != nil {
+		d.Credentials = secretCredentials{client: p.cfg.Client, log: p.log}
+	}
+	return d
+}
+
+// event records a pod event when a recorder is configured.
+func (p *Provider) event(pod *corev1.Pod, eventType, reason, format string, args ...any) {
+	if p.cfg.Events != nil {
+		p.cfg.Events.Eventf(pod, eventType, reason, format, args...)
+	}
 }
 
 // Close stops serving and releases the runtime. Pod processes keep running so
@@ -417,8 +442,12 @@ func (p *Provider) toPod(t *tracked) *corev1.Pod {
 	for c := range t.restarts.pending {
 		backoff[c] = true
 	}
+	pulling := make(map[string]bool, len(t.restarts.pullPending))
+	for c := range t.restarts.pullPending {
+		pulling[c] = true
+	}
 	p.mu.Unlock()
-	pod.Status = toPodStatus(pod, st, p.cfg.NodeIP, backoff)
+	pod.Status = toPodStatus(pod, st, p.cfg.NodeIP, backoff, pulling)
 	return pod
 }
 

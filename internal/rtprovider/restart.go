@@ -3,6 +3,7 @@ package rtprovider
 import (
 	"context"
 	"fmt"
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,13 +22,20 @@ const (
 type restartState struct {
 	handled map[string]string
 	pending map[string]bool
+	// Image pulls: attempts so far, containers with a retry scheduled, and
+	// the container instance a "Pulled" event was last recorded for.
+	pulls       map[string]int32
+	pullPending map[string]bool
+	pulledFor   map[string]string
 }
 
-// maybeRestart applies the pod's restartPolicy to every terminated container.
-// runtimed never restarts on exit; the provider is the single authority.
+// maybeRestart applies the pod's restartPolicy to every terminated container
+// and retries every container that could not start. runtimed does neither on
+// its own; the provider is the single authority.
 func (p *Provider) maybeRestart(t *tracked, st *runtimev1.PodStatus) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.retryStarts(t, st)
 	policy := t.pod.Spec.RestartPolicy
 	for _, cs := range st.GetContainerStatuses() {
 		term := cs.GetState().GetTerminated()
@@ -70,6 +78,73 @@ func (p *Provider) restartAfter(podID, container string, delay time.Duration) {
 			p.log.Warn("restart container", "pod", podID, "container", container, "err", err, "startErr", serr)
 		}
 	}
+	if r, err := p.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: podID}); err == nil {
+		p.observe(r.GetStatus())
+	}
+}
+
+// retryStarts schedules a StartContainer, on the kubelet's image back-off
+// schedule, for each container waiting on a retryable failure, and records
+// the kubelet's pull events. Callers hold p.mu.
+func (p *Provider) retryStarts(t *tracked, st *runtimev1.PodStatus) {
+	r := &t.restarts
+	if r.pulls == nil {
+		r.pulls, r.pullPending, r.pulledFor = map[string]int32{}, map[string]bool{}, map[string]string{}
+	}
+	for _, cs := range slices.Concat(st.GetInitContainerStatuses(), st.GetContainerStatuses()) {
+		c := cs.GetName()
+		w := cs.GetState().GetWaiting()
+		if w == nil || !retryable(w.GetFailureReason()) {
+			if w == nil {
+				delete(r.pulls, c)
+			}
+			if pull := cs.GetImagePull(); pull != nil && cs.GetContainerId() != "" && r.pulledFor[c] != cs.GetContainerId() {
+				r.pulledFor[c] = cs.GetContainerId()
+				if pull.GetPulled() {
+					p.event(t.pod, corev1.EventTypeNormal, "Pulled", "Successfully pulled image %q in %s", cs.GetImage(), pull.GetDuration().AsDuration().Round(time.Millisecond))
+				} else {
+					p.event(t.pod, corev1.EventTypeNormal, "Pulled", "Container image %q already present on machine", cs.GetImage())
+				}
+			}
+			continue
+		}
+		if r.pullPending[c] {
+			continue
+		}
+		delay := backoff(r.pulls[c])
+		r.pulls[c]++
+		r.pullPending[c] = true
+		if w.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG {
+			p.event(t.pod, corev1.EventTypeWarning, "Failed", "Error: %s", w.GetMessage())
+		} else {
+			p.event(t.pod, corev1.EventTypeWarning, "Failed", "Failed to pull image %q: %s", cs.GetImage(), w.GetMessage())
+			p.event(t.pod, corev1.EventTypeNormal, "BackOff", "Back-off pulling image %q", cs.GetImage())
+		}
+		p.log.Info("container could not start; retrying after back-off", "pod", key(t.pod), "container", c,
+			"reason", w.GetFailureReason().String(), "message", w.GetMessage(), "backoff", delay)
+		go p.startAfter(st.GetPodId(), c, delay)
+	}
+}
+
+// startAfter retries a container that could not start. It stays pending
+// until runtimed answers, so a status seen meanwhile schedules nothing.
+func (p *Provider) startAfter(podID, container string, delay time.Duration) {
+	time.Sleep(delay)
+	p.mu.Lock()
+	_, ok := p.pods[podID]
+	p.mu.Unlock()
+	if !ok {
+		return // deleted during the back-off
+	}
+	ctx := context.Background()
+	if _, err := p.rt.StartContainer(ctx, &runtimev1.StartContainerRequest{PodId: podID, Container: container}); err != nil {
+		p.log.Warn("start container", "pod", podID, "container", container, "err", err)
+	}
+	p.mu.Lock()
+	if t, ok := p.pods[podID]; ok {
+		delete(t.restarts.pullPending, container)
+	}
+	p.mu.Unlock()
 	if r, err := p.rt.GetPodStatus(ctx, &runtimev1.GetPodStatusRequest{PodId: podID}); err == nil {
 		p.observe(r.GetStatus())
 	}

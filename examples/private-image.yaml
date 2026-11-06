@@ -1,0 +1,21 @@
+# A darwin/arm64 image from a private registry. Build and push one with:
+#   GOOS=darwin GOARCH=arm64 go build -o hello ./your/cmd
+#   bin/mkimage -ref registry.example.com/team/hello:1 ./hello
+# then give the namespace a pull secret:
+#   kubectl create secret docker-registry regcred \
+#     --docker-server=registry.example.com --docker-username=... --docker-password=...
+apiVersion: v1
+kind: Pod
+metadata:
+  name: hello-private
+spec:
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: virtual-kubelet.io/provider
+      operator: Exists
+  imagePullSecrets:
+    - name: regcred
+  containers:
+    - name: hello
+      image: registry.example.com/team/hello:1

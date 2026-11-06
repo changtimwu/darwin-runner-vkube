@@ -12,6 +12,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/kubernetes/scheme"
+	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/record"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 
@@ -48,16 +51,26 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 		return nil, err
 	}
 	return rtprovider.New(ctx, rtprovider.Config{
-		NodeName:        o.nodeName,
-		NodeIP:          ip,
-		Root:            filepath.Join(dataDir, "runtime"),
-		PodLogsDir:      filepath.Join(dataDir, "pod-logs"),
-		PodUID:          uid,
-		PodGID:          gid,
-		SignaturePolicy: policy,
-		DisableGPU:      o.noGPU,
-		Logger:          o.logger,
+		NodeName:           o.nodeName,
+		NodeIP:             ip,
+		Root:               filepath.Join(dataDir, "runtime"),
+		PodLogsDir:         filepath.Join(dataDir, "pod-logs"),
+		PodUID:             uid,
+		PodGID:             gid,
+		SignaturePolicy:    policy,
+		DisableGPU:         o.noGPU,
+		Client:             client,
+		InsecureRegistries: o.insecureRegs,
+		Events:             eventRecorder(client, o.nodeName),
+		Logger:             o.logger,
 	}, existing)
+}
+
+// eventRecorder records pod events as this node, like the kubelet does.
+func eventRecorder(client kubernetes.Interface, nodeName string) record.EventRecorder {
+	b := record.NewBroadcaster()
+	b.StartRecordingToSink(&typedcorev1.EventSinkImpl{Interface: client.CoreV1().Events(metav1.NamespaceAll)})
+	return b.NewRecorder(scheme.Scheme, corev1.EventSource{Component: "kubelet", Host: nodeName})
 }
 
 // podIdentity picks the uid/gid pods drop to. Unprivileged, pods share the

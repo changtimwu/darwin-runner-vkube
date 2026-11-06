@@ -33,7 +33,8 @@ const (
 
 // configureNode fills in the node object virtual-kubelet registers.
 // gpuFacts is nil for runtimes that cannot grant the GPU.
-func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, runtimeVersion string, gpuFacts *runtimev1.GPUFacts) {
+// dataDir's filesystem (images, pod dirs, logs) is the node's ephemeral storage.
+func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, dataDir, runtimeVersion string, gpuFacts *runtimev1.GPUFacts) {
 	n.Labels["kubernetes.io/os"] = "darwin"
 	n.Labels["kubernetes.io/arch"] = runtime.GOARCH
 	n.Labels["node.kubernetes.io/instance-type"] = "darwin-vk"
@@ -48,6 +49,10 @@ func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, r
 		v1.ResourceCPU:    *resource.NewQuantity(int64(runtime.NumCPU()), resource.DecimalSI),
 		v1.ResourceMemory: *resource.NewQuantity(int64(mem), resource.BinarySI),
 		v1.ResourcePods:   *resource.NewQuantity(int64(maxPods), resource.DecimalSI),
+	}
+	var fs unix.Statfs_t
+	if err := unix.Statfs(dataDir, &fs); err == nil {
+		capacity[v1.ResourceEphemeralStorage] = *resource.NewQuantity(int64(fs.Blocks)*int64(fs.Bsize), resource.BinarySI)
 	}
 	n.Status.Capacity = capacity
 	n.Status.Allocatable = capacity.DeepCopy()

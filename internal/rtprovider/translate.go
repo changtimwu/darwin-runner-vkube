@@ -50,6 +50,9 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 	if _, ok := pod.Annotations[runtimev1.AnnotationXcodeToolchain]; ok {
 		box.SandboxProfile.XcodeToolchainDir = p.developerDir
 	}
+	for _, s := range pod.Spec.ImagePullSecrets {
+		box.ImagePullSecrets = append(box.ImagePullSecrets, &runtimev1.LocalObjectReference{Name: s.Name})
+	}
 	if g := pod.Spec.TerminationGracePeriodSeconds; g != nil {
 		box.TerminationGracePeriodSeconds = *g
 	}
@@ -146,7 +149,9 @@ func deref(v *int64) int64 {
 // toPodStatus builds the corev1 status from runtimed's. The phase is derived
 // here rather than taken from runtimed, because the provider (not runtimed)
 // owns restartPolicy: a container that exited under Always is still Running.
-func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, backoff map[string]bool) corev1.PodStatus {
+// backoff names containers in CrashLoopBackOff, pulling those waiting to retry
+// a failed image pull.
+func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, backoff, pulling map[string]bool) corev1.PodStatus {
 	out := corev1.PodStatus{
 		Phase:    corev1.PodPending,
 		HostIP:   nodeIP,
@@ -160,8 +165,8 @@ func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, backof
 	if t := st.GetStartTime(); t != nil {
 		out.StartTime = &metav1.Time{Time: t.AsTime()}
 	}
-	out.InitContainerStatuses = toContainerStatuses(pod.Spec.InitContainers, st.GetInitContainerStatuses(), nil)
-	out.ContainerStatuses = toContainerStatuses(pod.Spec.Containers, st.GetContainerStatuses(), backoff)
+	out.InitContainerStatuses = toContainerStatuses(pod.Spec.InitContainers, st.GetInitContainerStatuses(), nil, pulling)
+	out.ContainerStatuses = toContainerStatuses(pod.Spec.Containers, st.GetContainerStatuses(), backoff, pulling)
 
 	initDone := true
 	for _, cs := range out.InitContainerStatuses {
@@ -225,7 +230,7 @@ func condition(t corev1.PodConditionType, ok bool, since *metav1.Time) corev1.Po
 	return c
 }
 
-func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerStatus, backoff map[string]bool) []corev1.ContainerStatus {
+func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerStatus, backoff, pulling map[string]bool) []corev1.ContainerStatus {
 	byName := map[string]*runtimev1.ContainerStatus{}
 	for _, s := range sts {
 		byName[s.GetName()] = s
@@ -252,6 +257,9 @@ func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerSta
 			RestartCount:         s.GetRestartCount(),
 			Started:              &started,
 		}
+		if w := s.GetState().GetWaiting(); w != nil && w.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED {
+			cs.State.Waiting.Reason = waitingReason(w.GetFailureReason(), pulling[c.Name])
+		}
 		if backoff[c.Name] && cs.State.Terminated != nil {
 			cs.LastTerminationState = cs.State
 			cs.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
@@ -263,6 +271,32 @@ func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerSta
 		out = append(out, cs)
 	}
 	return out
+}
+
+// waitingReason names a container that could not start in the kubelet's
+// words. runtimed leaves the reason empty for failures and types the cause,
+// because only the provider knows whether a retry is pending.
+func waitingReason(fr runtimev1.FailureReason, retrying bool) string {
+	switch fr {
+	case runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME:
+		return "InvalidImageName"
+	case runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL:
+		return "ErrImageNeverPull"
+	case runtimev1.FailureReason_FAILURE_REASON_CONTAINER_CONFIG:
+		return "CreateContainerConfigError"
+	}
+	if retrying {
+		return "ImagePullBackOff"
+	}
+	return "ErrImagePull"
+}
+
+// retryable reports whether starting the container again can succeed: a bad
+// image name cannot, anything else (registry down, Secret fixed later, image
+// pushed or loaded later) can.
+func retryable(fr runtimev1.FailureReason) bool {
+	return fr != runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED &&
+		fr != runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME
 }
 
 func toState(s *runtimev1.ContainerState) corev1.ContainerState {

@@ -44,7 +44,7 @@ flowchart LR
 | Kubernetes concept | On the Mac |
 |---|---|
 | Node | `kubernetes.io/os=darwin`, real CPU/memory capacity, tainted `virtual-kubelet.io/provider=darwin:NoSchedule` |
-| Container image | A `darwin/arm64` OCI image pulled, digest-pinned and unpacked with APFS `clonefile`. Unsigned binaries are ad-hoc signed. Or `image: native` with an absolute host `command`. |
+| Container image | A `darwin/arm64` OCI image pulled (with `imagePullSecrets`), digest-pinned and unpacked with APFS `clonefile`. Unsigned binaries are ad-hoc signed. Or `image: native` with an absolute host `command`. See [Images](#images). |
 | Isolation | A generated default-deny Seatbelt profile per pod: the pod can write only its own data dir, the user's home is denied, and so are other pods. As root, pods also drop to a dedicated `_darwinvk` user. |
 | GPU | The node advertises `mlx.k3sm.io/gpu` plus chip and memory labels. A pod that requests it gets Metal (AGX/IOSurface) access in its sandbox; other pods are denied. See [GPU pods](#gpu-pods). |
 | `restartPolicy` | `Always` / `OnFailure` / `Never`, with CrashLoopBackOff (10s doubling to 5m) |
@@ -63,7 +63,7 @@ The roadmap and design notes are in [issue #1](https://github.com/changtimwu/dar
 | v0 | ✅ | Unconfined host-process provider (`--runtime=process`) |
 | P0 | ✅ | Spike: runtimed in-process, OCI pull, GPU in sandbox ([findings](spike/p0/FINDINGS.md)) |
 | P1 | ✅ | runtimed-backed provider: lifecycle, restarts, logs, exec, port-forward, stats, re-attach, LaunchDaemon |
-| P2 | ⏳ | OCI polish: `imagePullSecrets`, HTTPS registries, signature policy, image GC |
+| P2 | ✅ | OCI images: `imagePullSecrets`, HTTPS and plain-HTTP registries, `ErrImagePull`/`ImagePullBackOff` with retries and events, signature policy, image GC, `mkimage` |
 | P3 | ✅ | GPU advertisement (`mlx.k3sm.io/gpu` capacity and labels), GPU memory admission, Xcode toolchain opt-in |
 | P4 | ⏳ | Volumes, probes, memory limits / `OOMKilled` |
 | P5 | ⏳ | Linux images through the `vm` RuntimeClass; routable pod networking and cluster DNS |
@@ -114,12 +114,39 @@ kubectl logs -f hello-mac
 kubectl exec -it hello-mac -- /bin/zsh
 ```
 
-To run your own image, build a `darwin/arm64` binary and package it as an OCI image. `spike/p0/testimage/mkimage` is a minimal example, and `examples/oci-gpu.yaml` shows a GPU pod.
+To run your own image, see [Images](#images). `examples/oci-gpu.yaml` shows a GPU pod.
 
 ### k3s clusters
 
 - Start the k3s server with `--egress-selector-mode disabled`. Otherwise the API server sends kubelet traffic through the k3s agent tunnel, which `darwin-vk` doesn't speak, and `logs`/`exec` fail with 502.
 - k3s verifies kubelet serving certificates. Issue `--tls-cert`/`--tls-key` signed by `/var/lib/rancher/k3s/server/tls/server-ca.{crt,key}`, with the Mac's IP in the SAN.
+
+## Images
+
+Pods run `darwin/arm64` OCI images: a filesystem of Mach-O binaries, not a Linux container. `make build` also builds `bin/mkimage`, which packages executables into a single-layer image and pushes it:
+
+```sh
+GOOS=darwin GOARCH=arm64 go build -o hello ./cmd/hello
+bin/mkimage -ref registry.example.com/team/hello:1 ./hello   # credentials from `docker login`
+```
+
+Each file goes in `/bin`; the first is the entrypoint, and a pod's `command` overrides it. Any registry that serves OCI images works. A multi-platform image needs a `darwin/arm64` entry.
+
+**Registries.** Pulls use HTTPS, trusting the Mac's system roots. Loopback and private (RFC 1918) addresses use plain HTTP. Name any other plain-HTTP registry with `--insecure-registry host:port`.
+
+**Private images.** Add `imagePullSecrets` as usual (`kubectl create secret docker-registry ...`). `darwin-vk` reads the Secret when it pulls, so a Secret created or fixed later is picked up by the next retry. Matching follows the kubelet: a key can be a host, `host:port`, `*.domain` or a path prefix, and the most specific one wins. See `examples/private-image.yaml`.
+
+**When a pull fails**, the container waits with the kubelet's reason and the pod gets `Failed` and `BackOff` events:
+
+| Reason | Retried |
+|---|---|
+| `ErrImagePull`, then `ImagePullBackOff` (registry error, auth, no `darwin/arm64` entry, signature rejected) | Yes: 10s doubling to 5m |
+| `ErrImageNeverPull` (`imagePullPolicy: Never` and the image isn't on the node) | Yes |
+| `InvalidImageName` | No |
+
+**Signatures.** Before exec, binaries are checked against `--signature-policy`. The default `adhoc-ok` signs unsigned binaries ad hoc. `require-signed` needs a real signing identity and `require-notarized` needs notarization. A rejected binary shows as `ImagePullBackOff`.
+
+**Disk.** Images are content-addressed and shared between pods. They are cloned (APFS `clonefile`) into each pod, so a copy costs almost nothing until a pod writes to it. When free space on the data volume drops under 5 GiB, unused images are removed until 10 GiB is free. The data volume's size is the node's `ephemeral-storage` capacity.
 
 ## GPU pods
 
@@ -160,6 +187,7 @@ A GPU pod must set a memory limit on every container. The node adds up the limit
 | `--signature-policy` | `adhoc-ok` | `adhoc-ok`, `require-signed` or `require-notarized` |
 | `--max-pods` | 20 | Advertised pod capacity |
 | `--disable-gpu` | false | Don't advertise the GPU, and reject pods that request it |
+| `--insecure-registry` | | Registry `host:port` to pull from over plain HTTP. Repeatable. |
 | `--taint` | true | Add the NoSchedule taint |
 
 If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays off. Pods still run, but `logs`, `exec` and `port-forward` are unavailable.
