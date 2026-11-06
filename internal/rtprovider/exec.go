@@ -5,14 +5,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sync"
 
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
+	corev1 "k8s.io/api/core/v1"
 	utilexec "k8s.io/client-go/util/exec"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 )
+
+// execCommand resolves an absolute command against the pod's filesystem
+// first, so `kubectl exec pod -- /bin/tool` runs the image's tool rather than
+// looking for it on the host. runtimed resolves only bare names.
+func (p *Provider) execCommand(pod *corev1.Pod, cmd []string) []string {
+	if len(cmd) == 0 || !filepath.IsAbs(cmd[0]) {
+		return cmd
+	}
+	inPod := filepath.Join(p.cfg.Root, "pods", string(pod.UID), "rootfs", cmd[0])
+	if fi, err := os.Stat(inPod); err == nil && fi.Mode().IsRegular() {
+		return append([]string{inPod}, cmd[1:]...)
+	}
+	return cmd
+}
 
 // RunInContainer serves `kubectl exec` through runtimed's Exec stream; the
 // command re-enters the pod's Seatbelt profile and identity.
@@ -28,7 +45,7 @@ func (p *Provider) RunInContainer(ctx context.Context, namespace, podName, conta
 		return err
 	}
 	first := &runtimev1.ExecRequest{
-		PodId: string(t.pod.UID), Container: container, Command: cmd, Tty: attach.TTY(),
+		PodId: string(t.pod.UID), Container: container, Command: p.execCommand(t.pod, cmd), Tty: attach.TTY(),
 		Stdin: attach.Stdin() != nil, Stdout: attach.Stdout() != nil, Stderr: attach.Stderr() != nil,
 	}
 	if err := stream.Send(first); err != nil {

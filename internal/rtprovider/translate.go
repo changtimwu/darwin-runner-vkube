@@ -46,6 +46,11 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 		},
 		TerminationGracePeriodSeconds: 30,
 		MemoryLimitBytes:              podMemoryLimit(pod),
+		QosClass:                      qosClass(pod.Status.QOSClass),
+	}
+	if p.cfg.PathShim != "" {
+		// dyld loads the shim inside the sandbox, so the pod must read it.
+		box.SandboxProfile.ExtraReadPaths = append(box.SandboxProfile.ExtraReadPaths, p.cfg.PathShim)
 	}
 	if _, ok := pod.Annotations[runtimev1.AnnotationXcodeToolchain]; ok {
 		box.SandboxProfile.XcodeToolchainDir = p.developerDir
@@ -64,6 +69,9 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 		}
 	}
 	var err error
+	if box.Volumes, err = toVolumes(pod.Spec.Volumes); err != nil {
+		return nil, err
+	}
 	if box.InitContainers, err = toContainers(pod.Spec.InitContainers); err != nil {
 		return nil, err
 	}
@@ -85,6 +93,7 @@ func toContainers(cs []corev1.Container) ([]*runtimev1.Container, error) {
 			Tty:             c.TTY,
 			Stdin:           c.Stdin,
 			ImagePullPolicy: pullPolicy(c.ImagePullPolicy),
+			VolumeMounts:    toVolumeMounts(c.VolumeMounts),
 		}
 		// "host" was darwin-vk v0's placeholder; both mean "run a host binary".
 		if rc.Image == "" || rc.Image == "host" {
@@ -115,6 +124,18 @@ func toContainers(cs []corev1.Container) ([]*runtimev1.Container, error) {
 		out = append(out, rc)
 	}
 	return out, nil
+}
+
+func qosClass(q corev1.PodQOSClass) runtimev1.QOSClass {
+	switch q {
+	case corev1.PodQOSGuaranteed:
+		return runtimev1.QOSClass_QOS_CLASS_GUARANTEED
+	case corev1.PodQOSBurstable:
+		return runtimev1.QOSClass_QOS_CLASS_BURSTABLE
+	case corev1.PodQOSBestEffort:
+		return runtimev1.QOSClass_QOS_CLASS_BEST_EFFORT
+	}
+	return runtimev1.QOSClass_QOS_CLASS_UNSPECIFIED
 }
 
 func pullPolicy(p corev1.PullPolicy) runtimev1.ImagePullPolicy {
@@ -149,24 +170,22 @@ func deref(v *int64) int64 {
 // toPodStatus builds the corev1 status from runtimed's. The phase is derived
 // here rather than taken from runtimed, because the provider (not runtimed)
 // owns restartPolicy: a container that exited under Always is still Running.
-// backoff names containers in CrashLoopBackOff, pulling those waiting to retry
-// a failed image pull.
-func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, backoff, pulling map[string]bool) corev1.PodStatus {
+func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, ov overrides) corev1.PodStatus {
 	out := corev1.PodStatus{
 		Phase:    corev1.PodPending,
 		HostIP:   nodeIP,
 		HostIPs:  []corev1.HostIP{{IP: nodeIP}},
 		PodIP:    nodeIP,
 		PodIPs:   []corev1.PodIP{{IP: nodeIP}},
-		QOSClass: corev1.PodQOSClass(st.GetQosClass()),
+		QOSClass: pod.Status.QOSClass, // computed by the API server at creation
 		Reason:   st.GetReason(),
 		Message:  st.GetMessage(),
 	}
 	if t := st.GetStartTime(); t != nil {
 		out.StartTime = &metav1.Time{Time: t.AsTime()}
 	}
-	out.InitContainerStatuses = toContainerStatuses(pod.Spec.InitContainers, st.GetInitContainerStatuses(), nil, pulling)
-	out.ContainerStatuses = toContainerStatuses(pod.Spec.Containers, st.GetContainerStatuses(), backoff, pulling)
+	out.InitContainerStatuses = toContainerStatuses(pod.Spec.InitContainers, st.GetInitContainerStatuses(), overrides{pulling: ov.pulling})
+	out.ContainerStatuses = toContainerStatuses(pod.Spec.Containers, st.GetContainerStatuses(), ov)
 
 	initDone := true
 	for _, cs := range out.InitContainerStatuses {
@@ -205,7 +224,7 @@ func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, backof
 		out.Phase = corev1.PodSucceeded
 	case succeeded+failed == n && failed > 0 && policy == corev1.RestartPolicyNever:
 		out.Phase = corev1.PodFailed
-	case running > 0 || succeeded+failed > 0 || len(backoff) > 0:
+	case running > 0 || succeeded+failed > 0 || len(ov.backoff) > 0:
 		out.Phase = corev1.PodRunning
 	}
 
@@ -230,7 +249,18 @@ func condition(t corev1.PodConditionType, ok bool, since *metav1.Time) corev1.Po
 	return c
 }
 
-func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerStatus, backoff, pulling map[string]bool) []corev1.ContainerStatus {
+// overrides is what the provider knows about containers that runtimed does
+// not: which are in CrashLoopBackOff, which wait to retry a pull, and what
+// startup and readiness probes decided.
+type overrides struct {
+	backoff, pulling map[string]bool
+	// probed holds containers whose probes decide Started and Ready.
+	probed map[string]probeView
+}
+
+type probeView struct{ started, ready bool }
+
+func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerStatus, ov overrides) []corev1.ContainerStatus {
 	byName := map[string]*runtimev1.ContainerStatus{}
 	for _, s := range sts {
 		byName[s.GetName()] = s
@@ -258,9 +288,13 @@ func toContainerStatuses(specs []corev1.Container, sts []*runtimev1.ContainerSta
 			Started:              &started,
 		}
 		if w := s.GetState().GetWaiting(); w != nil && w.GetFailureReason() != runtimev1.FailureReason_FAILURE_REASON_UNSPECIFIED {
-			cs.State.Waiting.Reason = waitingReason(w.GetFailureReason(), pulling[c.Name])
+			cs.State.Waiting.Reason = waitingReason(w.GetFailureReason(), ov.pulling[c.Name])
 		}
-		if backoff[c.Name] && cs.State.Terminated != nil {
+		if pv, ok := ov.probed[c.Name]; ok && cs.State.Running != nil {
+			cs.Started = &pv.started
+			cs.Ready = pv.started && pv.ready
+		}
+		if ov.backoff[c.Name] && cs.State.Terminated != nil {
 			cs.LastTerminationState = cs.State
 			cs.State = corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{
 				Reason:  "CrashLoopBackOff",

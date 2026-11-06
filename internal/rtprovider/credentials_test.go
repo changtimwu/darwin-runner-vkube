@@ -100,7 +100,7 @@ func TestWaitingReason(t *testing.T) {
 		{runtimev1.FailureReason_FAILURE_REASON_INVALID_IMAGE_NAME, false, "InvalidImageName"},
 		{runtimev1.FailureReason_FAILURE_REASON_IMAGE_NEVER_PULL, true, "ErrImageNeverPull"},
 	} {
-		got := toPodStatus(pod, waiting(tc.fr), "ip", nil, map[string]bool{"c": tc.pulling})
+		got := toPodStatus(pod, waiting(tc.fr), "ip", overrides{pulling: map[string]bool{"c": tc.pulling}})
 		w := got.ContainerStatuses[0].State.Waiting
 		if w == nil || w.Reason != tc.want || got.Phase != corev1.PodPending {
 			t.Errorf("%s pulling=%v: %+v phase %s, want %s/Pending", tc.fr, tc.pulling, w, got.Phase, tc.want)

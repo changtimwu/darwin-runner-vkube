@@ -34,7 +34,8 @@ const (
 // configureNode fills in the node object virtual-kubelet registers.
 // gpuFacts is nil for runtimes that cannot grant the GPU.
 // dataDir's filesystem (images, pod dirs, logs) is the node's ephemeral storage.
-func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, dataDir, runtimeVersion string, gpuFacts *runtimev1.GPUFacts) {
+// reserved is held back from allocatable for macOS and its other users.
+func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, dataDir, runtimeVersion string, reserved v1.ResourceList, gpuFacts *runtimev1.GPUFacts) {
 	n.Labels["kubernetes.io/os"] = "darwin"
 	n.Labels["kubernetes.io/arch"] = runtime.GOARCH
 	n.Labels["node.kubernetes.io/instance-type"] = "darwin-vk"
@@ -56,6 +57,15 @@ func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, d
 	}
 	n.Status.Capacity = capacity
 	n.Status.Allocatable = capacity.DeepCopy()
+	for name, q := range reserved {
+		if a, ok := n.Status.Allocatable[name]; ok {
+			a.Sub(q)
+			if a.Sign() < 0 {
+				a = *resource.NewQuantity(0, a.Format)
+			}
+			n.Status.Allocatable[name] = a
+		}
+	}
 	gpu.Apply(n, gpuFacts)
 
 	hostname := n.Name

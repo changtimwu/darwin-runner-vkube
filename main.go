@@ -21,12 +21,20 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 
 	"github.com/changtimwu/darwin-runner-vkube/internal/gpu"
 )
 
 func main() {
+	if len(os.Args) == 3 && os.Args[1] == "install-shadow-bin" {
+		if err := installShadowBin(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	hostname, _ := os.Hostname()
 	hostname = strings.ToLower(strings.TrimSuffix(hostname, ".local"))
 	home, _ := os.UserHomeDir()
@@ -51,6 +59,8 @@ func main() {
 		insecureAPI  = flag.Bool("insecure-no-auth", false, "serve kubelet API without auth when --client-ca is unset (DANGEROUS: grants host exec)")
 		maxPods      = flag.Int("max-pods", 20, "pod capacity advertised by the node")
 		taint        = flag.Bool("taint", true, "taint node with virtual-kubelet.io/provider=darwin:NoSchedule")
+		reservedStr  = flag.String("system-reserved", "memory=2Gi", "resources held back from pods for macOS and the desktop, e.g. cpu=1,memory=4Gi")
+		shadowBin    = flag.String("shadow-bin-dir", "", "root-owned dir of re-signed shells/coreutils (see install-shadow-bin), so /bin/sh pods see volume mounts")
 		insecureRegs []string
 		noGPU        = flag.Bool("disable-gpu", false, "do not advertise the GPU, and refuse pods that request "+string(gpu.ResourceName))
 		debug        = flag.Bool("debug", false, "debug logging")
@@ -66,6 +76,11 @@ func main() {
 		level = slog.LevelDebug
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
+	reserved, err := parseReserved(*reservedStr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
+	}
 	log.L = vkslog.FromSlog(logger)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -76,7 +91,7 @@ func main() {
 		nodeName: *nodeName, kubeconfig: *kubeconfig, dataDir: *dataDir, nodeIP: *nodeIP,
 		listen: *listen, tlsCert: *tlsCert, tlsKey: *tlsKey, clientCA: *clientCA,
 		insecureAPI: *insecureAPI, maxPods: *maxPods, taint: *taint,
-		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, noGPU: *noGPU, insecureRegs: insecureRegs, logger: logger,
+		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, noGPU: *noGPU, insecureRegs: insecureRegs, shadowBin: *shadowBin, reserved: reserved, logger: logger,
 	}); err != nil {
 		log.G(ctx).WithError(err).Error("exiting")
 		os.Exit(1)
@@ -85,9 +100,10 @@ func main() {
 
 type options struct {
 	nodeName, kubeconfig, dataDir, nodeIP, listen, tlsCert, tlsKey, clientCA string
-	runtime, podUser, sigPolicy                                              string
+	runtime, podUser, sigPolicy, shadowBin                                   string
 	insecureAPI, taint, rootPods, noGPU                                      bool
 	insecureRegs                                                             []string
+	reserved                                                                 v1.ResourceList
 	maxPods                                                                  int
 	logger                                                                   *slog.Logger
 }
@@ -119,8 +135,8 @@ func run(ctx context.Context, o options) error {
 			if err != nil {
 				return nil, nil, err
 			}
-			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, o.dataDir, "process://darwin", nil)
-			return p, nil, nil
+			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, o.dataDir, "process://darwin", o.reserved, nil)
+			return p, newNodeStatus(cfg.Node, o.dataDir, o.logger), nil
 		}
 	case "runtimed":
 		p, err := newRuntimedProvider(ctx, client, o, ip)
@@ -129,8 +145,8 @@ func run(ctx context.Context, o options) error {
 		}
 		defer p.Close()
 		newProvider = func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
-			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, o.dataDir, "runtimed://k3sm-runtimed", p.GPUFacts())
-			return p, nil, nil
+			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, o.dataDir, "runtimed://k3sm-runtimed", o.reserved, p.GPUFacts())
+			return p, newNodeStatus(cfg.Node, o.dataDir, o.logger), nil
 		}
 	default:
 		return fmt.Errorf("unknown --runtime %q", o.runtime)

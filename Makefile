@@ -6,6 +6,7 @@ build: deps
 	go build -o bin/darwin-vk .
 	go build -o bin/mkimage ./cmd/mkimage
 	cd third_party/runtimed && go build -o ../../bin/k3sm-execshim ./cmd/k3sm-execshim
+	third_party/runtimed/hack/build-pathshim.sh $(CURDIR)/bin
 
 deps:
 	@test -d third_party/runtimed/.git -a -d third_party/apis/.git || hack/fetch-deps.sh

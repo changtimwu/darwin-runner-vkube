@@ -51,6 +51,10 @@ flowchart LR
 | Logs | CRI-format files; `kubectl logs` with `-f`, `--tail`, `--previous`, `--timestamps`, `--since` |
 | `kubectl exec` | Re-enters the pod's sandbox and identity. TTY, stdin and exit codes are supported. |
 | `kubectl port-forward` / `top` | Supported. `top` uses `proc_pid_rusage` accounting through `/metrics/resource`. |
+| Volumes | `configMap`, `secret`, `emptyDir`, `downwardAPI` and `projected` (including the default service account token), kept up to date. See [Pod features](#pod-features). |
+| Probes and hooks | Liveness, readiness and startup probes (exec, HTTP, TCP, gRPC); `postStart` and `preStop` hooks |
+| Memory limits | Enforced; a container over its limit is `OOMKilled` |
+| Node conditions | `MemoryPressure`, `DiskPressure` and `PIDPressure` from the Mac; `--system-reserved` keeps memory for macOS |
 | Pod IP | The node IP (host network) |
 | Daemon restart | Running pods are re-attached rather than restarted |
 
@@ -65,7 +69,7 @@ The roadmap and design notes are in [issue #1](https://github.com/changtimwu/dar
 | P1 | ✅ | runtimed-backed provider: lifecycle, restarts, logs, exec, port-forward, stats, re-attach, LaunchDaemon |
 | P2 | ✅ | OCI images: `imagePullSecrets`, HTTPS and plain-HTTP registries, `ErrImagePull`/`ImagePullBackOff` with retries and events, signature policy, image GC, `mkimage` |
 | P3 | ✅ | GPU advertisement (`mlx.k3sm.io/gpu` capacity and labels), GPU memory admission, Xcode toolchain opt-in |
-| P4 | ⏳ | Volumes, probes, memory limits / `OOMKilled` |
+| P4 | ✅ | Volumes, probes, lifecycle hooks, `OOMKilled`, QoS, node conditions, system reserve |
 | P5 | ⏳ | Linux images through the `vm` RuntimeClass; routable pod networking and cluster DNS |
 
 ## Requirements
@@ -148,6 +152,23 @@ Each file goes in `/bin`; the first is the entrypoint, and a pod's `command` ove
 
 **Disk.** Images are content-addressed and shared between pods. They are cloned (APFS `clonefile`) into each pod, so a copy costs almost nothing until a pod writes to it. When free space on the data volume drops under 5 GiB, unused images are removed until 10 GiB is free. The data volume's size is the node's `ephemeral-storage` capacity.
 
+## Pod features
+
+**Volumes.** `configMap`, `secret`, `emptyDir`, `downwardAPI` and `projected` volumes work, including `items`, `defaultMode`, `optional` and `subPath`. ConfigMap and Secret changes reach running pods within about a minute, except through `subPath`. The service account token every pod gets is minted with the TokenRequest API, bound to the pod, and renewed before it expires. A pod whose ConfigMap or Secret doesn't exist yet waits in `Pending` with `FailedMount` events and starts once it appears.
+
+Not supported, and rejected with `AdmissionRejected` rather than run without the volume: `hostPath`, `persistentVolumeClaim` and other volume types, and downward API files for all of `metadata.labels` or `metadata.annotations` (use `metadata.labels['key']`).
+
+There is no chroot. runtimed writes each volume into the pod's own directory, and a small library loaded into the pod (`libk3sm_pathrebase_shim.dylib`) makes the mount path resolve there. Two consequences:
+
+- macOS doesn't load such libraries into its own binaries, such as `/bin/sh`, so `deploy/install.sh` also installs re-signed copies of the common shells and tools (`darwin-vk install-shadow-bin`, passed with `--shadow-bin-dir`). Your own binaries need nothing extra.
+- Pods may not read anything under `/Users`. A build run from your home directory, rather than installed with `deploy/install.sh`, therefore skips the library and logs a warning: pods start, but don't see their volumes at the mount paths.
+
+`kubectl exec pod -- /bin/tool` runs the image's `/bin/tool` when the image has one, and the host's otherwise.
+
+**Probes and hooks.** Liveness, readiness and startup probes run with the kubelet's semantics (thresholds, periods, startup gating), using exec, HTTP, TCP or gRPC checks. A failed liveness or startup probe kills the container and `restartPolicy` decides what happens next. `postStart` and `preStop` hooks (exec, HTTP or sleep) run as on Linux, and `preStop` shares the termination grace period.
+
+**Resources.** A container over its memory limit is killed with `OOMKilled`. Memory is sampled, not capped, so a fast allocator can overshoot the limit briefly before it is killed. CPU limits aren't enforced. The node holds back `--system-reserved` (2 GiB of memory by default) from what it offers pods, for macOS and anything else running on the Mac. It reports `MemoryPressure` when macOS reaches critical memory pressure (the routine "warning" level is ignored), `DiskPressure` below 5 GiB free on the data volume, and `PIDPressure` above 90% of the process limit.
+
 ## GPU pods
 
 At startup runtimed probes the GPU (it opens the Metal device and runs a kernel). If Metal works and the sandbox can grant it, the node advertises:
@@ -188,6 +209,8 @@ A GPU pod must set a memory limit on every container. The node adds up the limit
 | `--max-pods` | 20 | Advertised pod capacity |
 | `--disable-gpu` | false | Don't advertise the GPU, and reject pods that request it |
 | `--insecure-registry` | | Registry `host:port` to pull from over plain HTTP. Repeatable. |
+| `--system-reserved` | `memory=2Gi` | Resources held back from pods, e.g. `cpu=1,memory=4Gi` |
+| `--shadow-bin-dir` | | Root-owned directory of re-signed shells and tools, so shell pods see their volumes. `deploy/install.sh` creates and sets it. |
 | `--taint` | true | Add the NoSchedule taint |
 
 If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays off. Pods still run, but `logs`, `exec` and `port-forward` are unavailable.
@@ -197,6 +220,7 @@ If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays 
 - **Host networking.** The pod IP is the node IP, so two pods binding the same port conflict. Cluster DNS and ClusterIP Services aren't reachable from Mac pods yet (P5).
 - **macOS images only.** Linux images need the `vm` RuntimeClass (P5).
 - **One trust domain per node.** Seatbelt limits what a pod can reach on the filesystem, but there are no separate network namespaces. Don't run mutually untrusted tenants on one Mac.
+- **No persistent volumes or hostPath** yet. Use an emptyDir for scratch space.
 - **Upgrades restart pods.** runtimed only re-attaches processes spawned by the same binary, so a new `darwin-vk` build restarts every pod.
 - Seatbelt is private Apple SPI, and runtimed carries a symbol canary for it. A macOS update could break it.
 

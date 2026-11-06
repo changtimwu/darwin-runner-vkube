@@ -69,7 +69,7 @@ func (p *Provider) restartAfter(podID, container string, delay time.Duration) {
 	if !ok {
 		return // deleted during the back-off
 	}
-	ctx := context.Background()
+	ctx := withPod(context.Background(), t.pod)
 	_, err := p.rt.RestartContainer(ctx, &runtimev1.RestartContainerRequest{PodId: podID, Container: container, Reason: "container exited"})
 	if err != nil {
 		// A container that died while the daemon was down has no process to
@@ -131,12 +131,12 @@ func (p *Provider) retryStarts(t *tracked, st *runtimev1.PodStatus) {
 func (p *Provider) startAfter(podID, container string, delay time.Duration) {
 	time.Sleep(delay)
 	p.mu.Lock()
-	_, ok := p.pods[podID]
+	t, ok := p.pods[podID]
 	p.mu.Unlock()
 	if !ok {
 		return // deleted during the back-off
 	}
-	ctx := context.Background()
+	ctx := withPod(context.Background(), t.pod)
 	if _, err := p.rt.StartContainer(ctx, &runtimev1.StartContainerRequest{PodId: podID, Container: container}); err != nil {
 		p.log.Warn("start container", "pod", podID, "container", container, "err", err)
 	}

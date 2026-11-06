@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,9 +63,32 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 		DisableGPU:         o.noGPU,
 		Client:             client,
 		InsecureRegistries: o.insecureRegs,
+		PathShim:           pathShim(o.logger),
+		ShadowBinDir:       o.shadowBin,
 		Events:             eventRecorder(client, o.nodeName),
 		Logger:             o.logger,
 	}, existing)
+}
+
+// pathShim is the path-rebase library installed beside the binary, which lets
+// pods see their volumes at the mount paths they asked for. "" disables it.
+// The sandbox never grants pods anything under /Users, so a build run from a
+// home directory cannot use it.
+func pathShim(log *slog.Logger) string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	p := filepath.Join(filepath.Dir(exe), "libk3sm_pathrebase_shim.dylib")
+	if _, err := os.Stat(p); err != nil {
+		log.Warn("path-rebase shim not found; volumes are written but not visible at their mount paths", "want", p)
+		return ""
+	}
+	if strings.HasPrefix(p, "/Users/") {
+		log.Warn("path-rebase shim is under /Users, which pods cannot read; volumes are written but not visible at their mount paths (install with deploy/install.sh)", "path", p)
+		return ""
+	}
+	return p
 }
 
 // eventRecorder records pod events as this node, like the kubelet does.

@@ -25,6 +25,10 @@ rules:
   - apiGroups: [""]
     resources: [configmaps, secrets, services]
     verbs: [get, list, watch]
+  # Projected service account tokens (the default kube-api-access volume).
+  - apiGroups: [""]
+    resources: [serviceaccounts/token]
+    verbs: [create]
   - apiGroups: ["", events.k8s.io]
     resources: [events]
     verbs: [create, patch, update]

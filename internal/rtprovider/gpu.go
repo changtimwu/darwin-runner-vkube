@@ -32,7 +32,7 @@ func (p *Provider) admitGPU(pod *corev1.Pod, box *runtimev1.PodBox) error {
 			continue
 		}
 		// Finished pods hold no GPU memory, as the scheduler also assumes.
-		if ph := toPodStatus(t.pod, t.status, "", nil, nil).Phase; ph == corev1.PodSucceeded || ph == corev1.PodFailed {
+		if ph := toPodStatus(t.pod, t.status, "", overrides{}).Phase; ph == corev1.PodSucceeded || ph == corev1.PodFailed {
 			continue
 		}
 		admitted += podMemoryLimit(t.pod)

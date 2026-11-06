@@ -11,6 +11,7 @@
     <string>--client-ca</string><string>/etc/darwin-vk/cluster-ca.crt</string>
     <string>--data-dir</string><string>/var/lib/darwin-vk</string>
     <string>--pod-user</string><string>_darwinvk</string>
+    <string>--shadow-bin-dir</string><string>/usr/local/libexec/darwin-vk/shadow-bin</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>

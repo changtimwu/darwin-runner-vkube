@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/record"
@@ -52,6 +53,10 @@ type Config struct {
 	// InsecureRegistries are registry host[:port]s pulled over plain HTTP.
 	// Loopback and RFC 1918 addresses already are.
 	InsecureRegistries []string
+	// PathShim is the path-rebase DYLD library that makes volume mounts appear
+	// at their mount paths, and ShadowBinDir the root-owned re-signed host
+	// shells it can load into. Empty disables each.
+	PathShim, ShadowBinDir string
 	// Events records pull events on pods. Nil records none.
 	Events record.EventRecorder
 	Logger *slog.Logger
@@ -88,6 +93,8 @@ type tracked struct {
 	// final marks a pod that finished before a daemon restart: runtimed no
 	// longer knows it, so its last API status stands and only logs are served.
 	final bool
+	// probes holds the probe and hook state of each running container.
+	probes map[string]*probeSet
 }
 
 // New starts the embedded runtime, re-attaches pods that survived a previous
@@ -108,6 +115,8 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 		Root:           cfg.Root,
 		PodLogsDir:     cfg.PodLogsDir,
 		RuntimeVersion: "darwin-vk",
+		PathShimPath:   cfg.PathShim,
+		ShadowBinDir:   cfg.ShadowBinDir,
 		Logger:         cfg.Logger.With("component", "runtimed"),
 	}, p.deps())
 	if err != nil {
@@ -146,6 +155,7 @@ func (p *Provider) deps() runtime.Deps {
 	d := runtime.Deps{ClusterRegistries: p.cfg.InsecureRegistries}
 	if p.cfg.Client != nil {
 		d.Credentials = secretCredentials{client: p.cfg.Client, log: p.log}
+		d.Resolver = kubeResolver{client: p.cfg.Client}
 	}
 	return d
 }
@@ -192,7 +202,7 @@ func (p *Provider) reattach(ctx context.Context, pods []*corev1.Pod) {
 			p.log.Warn("re-attach: translate", "pod", key(pod), "err", err)
 			continue
 		}
-		st, err := p.rt.AttachPod(ctx, box)
+		st, err := p.rt.AttachPod(withPod(ctx, pod), box)
 		if err != nil {
 			p.log.Info("re-attach refused; pod will be recreated", "pod", key(pod), "err", err)
 			continue
@@ -220,39 +230,64 @@ func (p *Provider) pruneLogDirs(existing []*corev1.Pod) {
 
 // CreatePod materializes the pod's log tree and asks runtimed to start it.
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
+	t := &tracked{pod: pod.DeepCopy()}
 	box, err := p.podBox(pod)
 	if err != nil {
-		return errdefs.AsInvalidInput(err)
+		p.reject(t, err)
+		return nil
 	}
 	if err := ensureLogDirs(box.GetLogDirectory(), pod); err != nil {
 		return err
 	}
-	t := &tracked{pod: pod.DeepCopy()}
 	p.mu.Lock()
 	if err := p.admitGPU(pod, box); err != nil {
+		p.mu.Unlock()
 		if !errdefs.IsInvalidInput(err) {
-			p.mu.Unlock()
 			return err // retried until it fits
 		}
-		// Rejected for good, as the kubelet does: Failed releases the
-		// scheduler's slot, where a Pending retry would hold it forever.
-		t.final = true
-		t.pod.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "AdmissionRejected", Message: err.Error()}
-		p.pods[box.GetPodId()] = t
-		p.mu.Unlock()
-		p.log.Info("pod rejected", "pod", key(pod), "err", err)
-		p.emit(t.pod.DeepCopy())
+		p.reject(t, err)
 		return nil
 	}
 	p.pods[box.GetPodId()] = t
 	p.mu.Unlock()
 
-	resp, err := p.rt.CreatePod(ctx, &runtimev1.CreatePodRequest{Pod: box})
+	resp, err := p.rt.CreatePod(withPod(ctx, pod), &runtimev1.CreatePodRequest{Pod: box})
+	if err == nil && resp.GetError() != nil {
+		err = errors.New(resp.GetError().GetMessage())
+	}
 	if err != nil {
-		return fmt.Errorf("runtimed create pod %s: %w", key(pod), err)
+		p.mu.Lock()
+		delete(p.pods, box.GetPodId())
+		p.mu.Unlock()
+		if resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_INVALID_POD_BOX {
+			p.reject(t, err)
+			return nil
+		}
+		// Like the kubelet, keep the pod Pending and let virtual-kubelet
+		// retry: a missing ConfigMap or Secret may appear later.
+		reason := "FailedCreatePodSandBox"
+		if resp.GetFailureReason() == runtimev1.FailureReason_FAILURE_REASON_ROOTFS_SETUP {
+			reason = "FailedMount"
+		}
+		p.event(pod, corev1.EventTypeWarning, reason, "%s", err)
+		return fmt.Errorf("create pod %s: %w", key(pod), err)
 	}
 	p.observe(resp.GetStatus())
 	return nil
+}
+
+// reject fails a pod this node can never run, as the kubelet does at
+// admission: Failed releases the scheduler's resources, where a Pending retry
+// would hold them forever.
+func (p *Provider) reject(t *tracked, err error) {
+	t.final = true
+	t.pod.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "AdmissionRejected", Message: err.Error()}
+	p.mu.Lock()
+	p.pods[string(t.pod.UID)] = t
+	p.mu.Unlock()
+	p.log.Info("pod rejected", "pod", key(t.pod), "err", err)
+	p.event(t.pod, corev1.EventTypeWarning, "AdmissionRejected", "%s", err)
+	p.emit(t.pod.DeepCopy())
 }
 
 // UpdatePod records metadata changes; runtimed refuses spec changes as k8s does.
@@ -271,15 +306,44 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	p.mu.Lock()
 	t, ok := p.pods[id]
 	delete(p.pods, id)
+	var running []corev1.Container
+	if ok {
+		stopProbes(t)
+		for _, c := range t.pod.Spec.Containers {
+			for _, cs := range t.status.GetContainerStatuses() {
+				if cs.GetName() == c.Name && cs.GetState().GetRunning() != nil {
+					running = append(running, c)
+				}
+			}
+		}
+	}
 	p.mu.Unlock()
 	if !ok {
-		return errdefs.NotFoundf("pod %s not found", key(pod))
+		// Not tracked, e.g. not re-attached after an upgrade. virtual-kubelet
+		// only removes the pod once it sees a terminated status, so report one
+		// rather than NotFound, which would leave it Terminating forever.
+		t = &tracked{pod: pod.DeepCopy()}
 	}
 	var grace int64
 	if g := pod.DeletionGracePeriodSeconds; g != nil {
 		grace = *g
 	} else if g := pod.Spec.TerminationGracePeriodSeconds; g != nil {
 		grace = *g
+	}
+	// preStop hooks run in parallel and share the grace period with the
+	// SIGTERM that follows, as on the kubelet.
+	start := time.Now()
+	var wg sync.WaitGroup
+	for _, c := range running {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			p.preStop(ctx, t.pod, c, grace)
+		}()
+	}
+	wg.Wait()
+	if len(running) > 0 && grace > 0 {
+		grace = max(grace-int64(time.Since(start).Seconds()), 1)
 	}
 	if _, err := p.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace}); err != nil {
 		p.log.Warn("runtimed delete pod", "pod", key(pod), "err", err)
@@ -299,7 +363,27 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 		cs.Ready = false
 	}
 	p.emit(gone)
+	go p.finishDelete(pod)
 	return nil
+}
+
+// finishDelete removes the pod object once its containers are gone, as the
+// kubelet does. virtual-kubelet would otherwise wait out the whole grace
+// period: it ignores status-only updates, so it never notices the pod
+// stopped. The UID precondition spares a recreated pod with the same name.
+func (p *Provider) finishDelete(pod *corev1.Pod) {
+	if p.cfg.Client == nil {
+		return
+	}
+	time.Sleep(time.Second) // let virtual-kubelet record the final status first
+	zero := int64(0)
+	err := p.cfg.Client.CoreV1().Pods(pod.Namespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{
+		GracePeriodSeconds: &zero,
+		Preconditions:      &metav1.Preconditions{UID: &pod.UID},
+	})
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
+		p.log.Warn("remove deleted pod", "pod", key(pod), "err", err)
+	}
 }
 
 // GetPod returns the pod with its current runtime status.
@@ -343,6 +427,7 @@ func (p *Provider) NotifyPods(ctx context.Context, cb func(*corev1.Pod)) {
 	p.mu.Unlock()
 	go p.watch(ctx)
 	go p.resync(ctx, 10*time.Second)
+	go p.refreshVolumes(ctx, time.Minute)
 }
 
 func (p *Provider) watch(ctx context.Context) {
@@ -392,6 +477,34 @@ func (p *Provider) resync(ctx context.Context, every time.Duration) {
 	}
 }
 
+// refreshVolumes re-renders configMap, secret, downwardAPI and projected
+// volumes from current data and renews service account tokens, like the
+// kubelet's periodic volume sync.
+func (p *Provider) refreshVolumes(ctx context.Context, every time.Duration) {
+	tick := time.NewTicker(every)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		p.mu.Lock()
+		pods := make([]*corev1.Pod, 0, len(p.pods))
+		for _, t := range p.pods {
+			if !t.final && len(t.pod.Spec.Volumes) > 0 {
+				pods = append(pods, t.pod)
+			}
+		}
+		p.mu.Unlock()
+		for _, pod := range pods {
+			if _, err := p.rt.RefreshProjectedVolumes(withPod(ctx, pod), string(pod.UID)); err != nil {
+				p.log.Warn("refresh volumes", "pod", key(pod), "err", err)
+			}
+		}
+	}
+}
+
 // observe records a runtime status, drives restarts, and notifies VK.
 func (p *Provider) observe(st *runtimev1.PodStatus) {
 	if st == nil {
@@ -407,6 +520,9 @@ func (p *Provider) observe(st *runtimev1.PodStatus) {
 		return
 	}
 	p.maybeRestart(t, st)
+	p.mu.Lock()
+	p.syncProbes(t, st)
+	p.mu.Unlock()
 	p.emit(p.toPod(t))
 }
 
@@ -438,16 +554,24 @@ func (p *Provider) toPod(t *tracked) *corev1.Pod {
 		return t.pod.DeepCopy()
 	}
 	pod, st := t.pod.DeepCopy(), t.status
-	backoff := make(map[string]bool, len(t.restarts.pending))
-	for c := range t.restarts.pending {
-		backoff[c] = true
+	ov := overrides{
+		backoff: make(map[string]bool, len(t.restarts.pending)),
+		pulling: make(map[string]bool, len(t.restarts.pullPending)),
+		probed:  make(map[string]probeView, len(t.probes)),
 	}
-	pulling := make(map[string]bool, len(t.restarts.pullPending))
+	for c := range t.restarts.pending {
+		ov.backoff[c] = true
+	}
 	for c := range t.restarts.pullPending {
-		pulling[c] = true
+		ov.pulling[c] = true
+	}
+	for c, ps := range t.probes {
+		if ps.decides() {
+			ov.probed[c] = probeView{started: ps.started, ready: ps.ready}
+		}
 	}
 	p.mu.Unlock()
-	pod.Status = toPodStatus(pod, st, p.cfg.NodeIP, backoff, pulling)
+	pod.Status = toPodStatus(pod, st, p.cfg.NodeIP, ov)
 	return pod
 }
 
