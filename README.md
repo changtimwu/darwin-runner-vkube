@@ -90,7 +90,7 @@ make test
 **2. On the cluster** (admin kubeconfig):
 
 ```sh
-kubectl apply -f deploy/rbac.yaml
+kubectl apply -f deploy/rbac.yaml deploy/runtimeclass.yaml
 ./deploy/make-kubeconfig.sh            # -> darwin-vk.kubeconfig, cluster-ca.crt
 ```
 
@@ -169,6 +169,16 @@ There is no chroot. runtimed writes each volume into the pod's own directory, an
 
 **Resources.** A container over its memory limit is killed with `OOMKilled`. Memory is sampled, not capped, so a fast allocator can overshoot the limit briefly before it is killed. CPU limits aren't enforced. The node holds back `--system-reserved` (2 GiB of memory by default) from what it offers pods, for macOS and anything else running on the Mac. It reports `MemoryPressure` when macOS reaches critical memory pressure (the routine "warning" level is ignored), `DiskPressure` below 5 GiB free on the data volume, and `PIDPressure` above 90% of the process limit.
 
+## Linux pods (`vm` RuntimeClass)
+
+A pod with `runtimeClassName: vm` runs a `linux/arm64` image in its own Virtualization.framework micro-VM, using runtimed's vm backend. Apply `deploy/runtimeclass.yaml` once; its scheduling stanza sends these pods to Mac nodes, so they need no node selector of their own. See `examples/vm-mixed.yaml`, which pairs a Postgres VM with a native GPU job.
+
+- **Size:** CPU limits set the vCPU count (rounded up) and the memory limit sets the guest's RAM. Without limits, runtimed picks a default.
+- **Guest kernel:** at startup darwin-vk downloads runtimed's pinned kernel and initramfs into the data dir and verifies their digests. It also needs `k3sm-vmhost`, signed with the virtualization entitlement, beside the binary (`make build` and `deploy/install.sh` handle both). If any of this is missing, `vm` pods are rejected with a reason and native pods are unaffected. `--disable-vm` turns it off.
+- **Networking:** the guest sits on macOS's private NAT network. The pod reports the node IP, and darwin-vk forwards each declared TCP `containerPort` from the node to the guest, so Services and other Mac pods reach it at `<node IP>:<port>`. Probes connect to the guest directly.
+- **Not available in VMs:** the GPU, which Virtualization.framework can't pass to Linux guests, and `fsGroup`.
+- **Local Network privacy:** macOS blocks self-built binaries from LAN addresses, including the VMs' network, unless an app approved the access. The root LaunchDaemon is exempt. A dev build started from a terminal needs that terminal app's Local Network permission. Under tmux there's no app to ask, so probes and forwarded ports fail with `no route to host`.
+
 ## GPU pods
 
 At startup runtimed probes the GPU (it opens the Metal device and runs a kernel). If Metal works and the sandbox can grant it, the node advertises:
@@ -207,6 +217,7 @@ A GPU pod must set a memory limit on every container. The node adds up the limit
 | `--allow-root-pods` | false | As root, allow pods to run as root (still sandboxed) |
 | `--signature-policy` | `adhoc-ok` | `adhoc-ok`, `require-signed` or `require-notarized` |
 | `--max-pods` | 20 | Advertised pod capacity |
+| `--disable-vm` | false | Reject `vm` RuntimeClass pods instead of fetching the guest kernel |
 | `--disable-gpu` | false | Don't advertise the GPU, and reject pods that request it |
 | `--insecure-registry` | | Registry `host:port` to pull from over plain HTTP. Repeatable. |
 | `--system-reserved` | `memory=2Gi` | Resources held back from pods, e.g. `cpu=1,memory=4Gi` |
@@ -218,7 +229,8 @@ If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays 
 ## Limitations
 
 - **Host networking.** The pod IP is the node IP, so two pods binding the same port conflict. Cluster DNS and ClusterIP Services aren't reachable from Mac pods yet (P5).
-- **macOS images only.** Linux images need the `vm` RuntimeClass (P5).
+- **Linux images run only in VMs.** Without `runtimeClassName: vm`, a pod's image must be `darwin/arm64`.
+- **Some Linux images fail in VMs.** runtimed's guest gives containers no `/dev/fd` or `/dev/std*`, so entrypoints that use bash process substitution, such as the official `postgres` image's, exit early.
 - **One trust domain per node.** Seatbelt limits what a pod can reach on the filesystem, but there are no separate network namespaces. Don't run mutually untrusted tenants on one Mac.
 - **No persistent volumes or hostPath** yet. Use an emptyDir for scratch space.
 - **Upgrades restart pods.** runtimed only re-attaches processes spawned by the same binary, so a new `darwin-vk` build restarts every pod.

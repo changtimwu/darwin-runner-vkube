@@ -59,7 +59,10 @@ type Config struct {
 	PathShim, ShadowBinDir string
 	// Events records pull events on pods. Nil records none.
 	Events record.EventRecorder
-	Logger *slog.Logger
+	// VMBackend runs pods of the "vm" RuntimeClass in Linux micro-VMs. Nil,
+	// or a backend that is not Available, refuses them.
+	VMBackend runtime.VMBackend
+	Logger    *slog.Logger
 }
 
 // Provider implements nodeutil.Provider and node.PodNotifier on top of runtimed.
@@ -79,10 +82,12 @@ type Provider struct {
 	// enforces.
 	gpu          *runtimev1.GPUFacts // nil when unknown or disabled
 	developerDir string              // granted by the xcode-toolchain annotation; "" grants nothing
+	vmAvailable  bool                // whether "vm" RuntimeClass pods can run
 
-	mu     sync.Mutex
-	pods   map[string]*tracked // keyed by pod UID (the runtimed pod_id)
-	notify func(*corev1.Pod)
+	mu       sync.Mutex
+	pods     map[string]*tracked // keyed by pod UID (the runtimed pod_id)
+	handlers map[string]string   // RuntimeClass name -> handler
+	notify   func(*corev1.Pod)
 }
 
 // tracked is what the provider keeps per pod that runtimed does not.
@@ -95,6 +100,9 @@ type tracked struct {
 	final bool
 	// probes holds the probe and hook state of each running container.
 	probes map[string]*probeSet
+	// vm marks a pod running in a micro-VM; fwd forwards its ports.
+	vm  bool
+	fwd *forwarder
 }
 
 // New starts the embedded runtime, re-attaches pods that survived a previous
@@ -110,7 +118,8 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 			return nil, err
 		}
 	}
-	p := &Provider{cfg: cfg, log: cfg.Logger, pods: map[string]*tracked{}, served: make(chan struct{})}
+	p := &Provider{cfg: cfg, log: cfg.Logger, pods: map[string]*tracked{}, handlers: map[string]string{}, served: make(chan struct{})}
+	p.vmAvailable = cfg.VMBackend != nil && cfg.VMBackend.Available()
 	rt, err := runtime.New(runtime.Config{
 		Root:           cfg.Root,
 		PodLogsDir:     cfg.PodLogsDir,
@@ -152,7 +161,10 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 }
 
 func (p *Provider) deps() runtime.Deps {
-	d := runtime.Deps{ClusterRegistries: p.cfg.InsecureRegistries}
+	d := runtime.Deps{ClusterRegistries: p.cfg.InsecureRegistries, Network: newGuestNetwork(p.cfg.NodeIP)}
+	if p.cfg.VMBackend != nil {
+		d.VMBackend = p.cfg.VMBackend
+	}
 	if p.cfg.Client != nil {
 		d.Credentials = secretCredentials{client: p.cfg.Client, log: p.log}
 		d.Resolver = kubeResolver{client: p.cfg.Client}
@@ -207,7 +219,7 @@ func (p *Provider) reattach(ctx context.Context, pods []*corev1.Pod) {
 			p.log.Info("re-attach refused; pod will be recreated", "pod", key(pod), "err", err)
 			continue
 		}
-		t := &tracked{pod: pod.DeepCopy(), status: st}
+		t := &tracked{pod: pod.DeepCopy(), status: st, vm: isVM(box)}
 		p.pods[box.GetPodId()] = t
 		p.log.Info("re-attached pod", "pod", key(pod))
 	}
@@ -239,6 +251,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := ensureLogDirs(box.GetLogDirectory(), pod); err != nil {
 		return err
 	}
+	t.vm = isVM(box)
 	p.mu.Lock()
 	if err := p.admitGPU(pod, box); err != nil {
 		p.mu.Unlock()
@@ -309,6 +322,7 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	var running []corev1.Container
 	if ok {
 		stopProbes(t)
+		t.fwd.close()
 		for _, c := range t.pod.Spec.Containers {
 			for _, cs := range t.status.GetContainerStatuses() {
 				if cs.GetName() == c.Name && cs.GetState().GetRunning() != nil {
@@ -522,6 +536,7 @@ func (p *Provider) observe(st *runtimev1.PodStatus) {
 	p.maybeRestart(t, st)
 	p.mu.Lock()
 	p.syncProbes(t, st)
+	p.syncForward(t, st)
 	p.mu.Unlock()
 	p.emit(p.toPod(t))
 }

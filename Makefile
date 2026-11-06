@@ -6,6 +6,8 @@ build: deps
 	go build -o bin/darwin-vk .
 	go build -o bin/mkimage ./cmd/mkimage
 	cd third_party/runtimed && go build -o ../../bin/k3sm-execshim ./cmd/k3sm-execshim
+	cd third_party/runtimed && go build -o ../../bin/k3sm-vmhost ./cmd/k3sm-vmhost
+	codesign --force --sign - --entitlements third_party/runtimed/cmd/k3sm-vmhost/vmhost.entitlements bin/k3sm-vmhost
 	third_party/runtimed/hack/build-pathshim.sh $(CURDIR)/bin
 
 deps:

@@ -19,9 +19,17 @@ import (
 
 // execCommand resolves an absolute command against the pod's filesystem
 // first, so `kubectl exec pod -- /bin/tool` runs the image's tool rather than
-// looking for it on the host. runtimed resolves only bare names.
+// looking for it on the host. runtimed resolves only bare names. A vm pod's
+// command already runs inside its guest.
 func (p *Provider) execCommand(pod *corev1.Pod, cmd []string) []string {
 	if len(cmd) == 0 || !filepath.IsAbs(cmd[0]) {
+		return cmd
+	}
+	p.mu.Lock()
+	t, ok := p.pods[string(pod.UID)]
+	vm := ok && t.vm
+	p.mu.Unlock()
+	if vm {
 		return cmd
 	}
 	inPod := filepath.Join(p.cfg.Root, "pods", string(pod.UID), "rootfs", cmd[0])

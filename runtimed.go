@@ -19,6 +19,9 @@ import (
 	"k8s.io/client-go/tools/record"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
+	"k3sm.io/runtimed/pkg/guestartifacts"
+	"k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 
 	"github.com/changtimwu/darwin-runner-vkube/internal/rtprovider"
 )
@@ -52,10 +55,11 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 	if err != nil {
 		return nil, err
 	}
+	root := filepath.Join(dataDir, "runtime")
 	return rtprovider.New(ctx, rtprovider.Config{
 		NodeName:           o.nodeName,
 		NodeIP:             ip,
-		Root:               filepath.Join(dataDir, "runtime"),
+		Root:               root,
 		PodLogsDir:         filepath.Join(dataDir, "pod-logs"),
 		PodUID:             uid,
 		PodGID:             gid,
@@ -66,6 +70,7 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 		PathShim:           pathShim(o.logger),
 		ShadowBinDir:       o.shadowBin,
 		Events:             eventRecorder(client, o.nodeName),
+		VMBackend:          vmBackend(ctx, o, root),
 		Logger:             o.logger,
 	}, existing)
 }
@@ -89,6 +94,37 @@ func pathShim(log *slog.Logger) string {
 		return ""
 	}
 	return p
+}
+
+// vmBackend fetches the pinned Linux guest kernel and initramfs and returns
+// the micro-VM backend, or nil when vm pods cannot run here. Like k3sm, a
+// failure only turns the vm RuntimeClass off; native pods are unaffected.
+func vmBackend(ctx context.Context, o options, root string) runtime.VMBackend {
+	if o.noVM {
+		return nil
+	}
+	pin, err := guestartifacts.Lookup(guestartifacts.ActiveGuestKernel)
+	if err != nil {
+		o.logger.Warn("vm RuntimeClass off: no guest kernel pin", "err", err)
+		return nil
+	}
+	ectx, cancel := context.WithTimeout(ctx, guestartifacts.DefaultFetchTimeout)
+	defer cancel()
+	art, err := guestartifacts.EnsureGuestArtifacts(ectx, filepath.Join(root, guestartifacts.GuestArtifactsSubdir), pin, &guestartifacts.HTTPFetcher{})
+	if err != nil {
+		o.logger.Warn("vm RuntimeClass off: guest kernel unavailable", "err", err)
+		return nil
+	}
+	b := sandbox.NewVMBackend(
+		sandbox.WithStateRoot(root),
+		sandbox.WithLogger(o.logger.With("component", "vm")),
+		sandbox.WithGuestArtifacts(guestartifacts.Locator(pin, art)))
+	if !b.Available() {
+		o.logger.Warn("vm RuntimeClass off: this host cannot run micro-VMs (needs macOS 26+ and k3sm-vmhost, signed with the virtualization entitlement, beside darwin-vk)")
+		return nil
+	}
+	o.logger.Info("vm RuntimeClass available", "guestKernel", guestartifacts.ActiveGuestKernel)
+	return b
 }
 
 // eventRecorder records pod events as this node, like the kubelet does.

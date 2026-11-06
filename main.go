@@ -62,6 +62,7 @@ func main() {
 		reservedStr  = flag.String("system-reserved", "memory=2Gi", "resources held back from pods for macOS and the desktop, e.g. cpu=1,memory=4Gi")
 		shadowBin    = flag.String("shadow-bin-dir", "", "root-owned dir of re-signed shells/coreutils (see install-shadow-bin), so /bin/sh pods see volume mounts")
 		insecureRegs []string
+		noVM         = flag.Bool("disable-vm", false, "refuse pods of the vm RuntimeClass instead of fetching the guest kernel and running micro-VMs")
 		noGPU        = flag.Bool("disable-gpu", false, "do not advertise the GPU, and refuse pods that request "+string(gpu.ResourceName))
 		debug        = flag.Bool("debug", false, "debug logging")
 	)
@@ -91,7 +92,7 @@ func main() {
 		nodeName: *nodeName, kubeconfig: *kubeconfig, dataDir: *dataDir, nodeIP: *nodeIP,
 		listen: *listen, tlsCert: *tlsCert, tlsKey: *tlsKey, clientCA: *clientCA,
 		insecureAPI: *insecureAPI, maxPods: *maxPods, taint: *taint,
-		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, noGPU: *noGPU, insecureRegs: insecureRegs, shadowBin: *shadowBin, reserved: reserved, logger: logger,
+		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, noGPU: *noGPU, noVM: *noVM, insecureRegs: insecureRegs, shadowBin: *shadowBin, reserved: reserved, logger: logger,
 	}); err != nil {
 		log.G(ctx).WithError(err).Error("exiting")
 		os.Exit(1)
@@ -101,7 +102,7 @@ func main() {
 type options struct {
 	nodeName, kubeconfig, dataDir, nodeIP, listen, tlsCert, tlsKey, clientCA string
 	runtime, podUser, sigPolicy, shadowBin                                   string
-	insecureAPI, taint, rootPods, noGPU                                      bool
+	insecureAPI, taint, rootPods, noGPU, noVM                                bool
 	insecureRegs                                                             []string
 	reserved                                                                 v1.ResourceList
 	maxPods                                                                  int

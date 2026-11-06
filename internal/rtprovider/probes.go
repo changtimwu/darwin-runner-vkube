@@ -252,7 +252,7 @@ func (p *Provider) runHandler(ctx context.Context, pod *corev1.Pod, c corev1.Con
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	host := p.cfg.NodeIP
+	host := p.probeHost(pod)
 	switch {
 	case a.exec != nil:
 		return p.execProbe(ctx, pod, c.Name, a.exec.Command)

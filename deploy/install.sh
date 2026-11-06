@@ -15,8 +15,9 @@ if [ "${1:-}" = "--uninstall" ]; then
   launchctl bootout system/$LABEL 2>/dev/null || true
   rm -f "$PLIST"
   # Stop pod process groups the daemon left running (they outlive it by design).
-  pkill -TERM -f "$BIN_DIR/k3sm-execshim" 2>/dev/null || true
-  sleep 10; pkill -KILL -f "$BIN_DIR/k3sm-execshim" 2>/dev/null || true
+  # vm pods' helpers too; each one's exit ends its guest.
+  pkill -TERM -f "$BIN_DIR/k3sm-(execshim|vmhost)" 2>/dev/null || true
+  sleep 10; pkill -KILL -f "$BIN_DIR/k3sm-(execshim|vmhost)" 2>/dev/null || true
   rm -rf "$BIN_DIR"
   echo "uninstalled (kept $ETC, /var/lib/darwin-vk and user $POD_USER)"
   exit 0
@@ -38,7 +39,7 @@ if ! id "$POD_USER" >/dev/null 2>&1; then
 fi
 
 install -d -m 755 "$BIN_DIR"
-install -m 755 bin/darwin-vk bin/k3sm-execshim bin/libk3sm_pathrebase_shim.dylib "$BIN_DIR/"
+install -m 755 bin/darwin-vk bin/k3sm-execshim bin/k3sm-vmhost bin/libk3sm_pathrebase_shim.dylib "$BIN_DIR/"
 # Re-signed shells and coreutils, so /bin/sh pods see their volume mounts.
 "$BIN_DIR/darwin-vk" install-shadow-bin "$BIN_DIR/shadow-bin"
 install -d -m 700 "$ETC"

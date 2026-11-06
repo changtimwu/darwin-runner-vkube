@@ -48,6 +48,20 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 		MemoryLimitBytes:              podMemoryLimit(pod),
 		QosClass:                      qosClass(pod.Status.QOSClass),
 	}
+	backend, err := p.backendFor(pod)
+	if err != nil {
+		return nil, err
+	}
+	if backend == runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		if requestsGPU(pod) {
+			return nil, fmt.Errorf("vm pods cannot use the GPU: Virtualization.framework has no GPU passthrough for Linux guests")
+		}
+		// Root inside the guest is confined by the hypervisor, not the host
+		// identity, so containers default to the image's own user.
+		box.Uid, box.Gid = 0, 0
+		box.SandboxProfile.Backend = backend
+		box.SandboxProfile.VmVcpus, box.SandboxProfile.VmMemoryBytes = vmSizing(pod)
+	}
 	if p.cfg.PathShim != "" {
 		// dyld loads the shim inside the sandbox, so the pod must read it.
 		box.SandboxProfile.ExtraReadPaths = append(box.SandboxProfile.ExtraReadPaths, p.cfg.PathShim)
@@ -68,7 +82,6 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 			FsGroup:    deref(sc.FSGroup),
 		}
 	}
-	var err error
 	if box.Volumes, err = toVolumes(pod.Spec.Volumes); err != nil {
 		return nil, err
 	}

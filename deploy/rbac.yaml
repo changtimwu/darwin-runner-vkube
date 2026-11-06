@@ -25,6 +25,10 @@ rules:
   - apiGroups: [""]
     resources: [configmaps, secrets, services]
     verbs: [get, list, watch]
+  # Resolves a pod's runtimeClassName to its handler (vm).
+  - apiGroups: [node.k8s.io]
+    resources: [runtimeclasses]
+    verbs: [get]
   # Projected service account tokens (the default kube-api-access volume).
   - apiGroups: [""]
     resources: [serviceaccounts/token]

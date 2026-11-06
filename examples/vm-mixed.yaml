@@ -1,0 +1,69 @@
+# One Mac, two runtimes: Postgres from Docker Hub in a Linux micro-VM, and a
+# native evaluation job on the Mac's GPU that writes its results into it.
+# Needs deploy/runtimeclass.yaml applied to the cluster.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: evaldb
+stringData:
+  POSTGRES_PASSWORD: change-me
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evaldb
+spec:
+  selector: {app: evaldb}
+  ports:
+    - port: 5432
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: evaldb
+  labels: {app: evaldb}
+spec:
+  runtimeClassName: vm            # stock linux/arm64 image, own kernel
+  containers:
+    - name: postgres
+      image: postgres:17-alpine
+      envFrom:
+        - secretRef: {name: evaldb}
+      ports:
+        - containerPort: 5432     # forwarded on the node IP
+      resources:
+        limits: {cpu: "2", memory: 1Gi}   # the VM's size: 2 vCPUs, 1 GiB
+      readinessProbe:
+        exec:
+          command: [pg_isready, -U, postgres]
+        periodSeconds: 5
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: eval
+spec:
+  # No runtimeClassName: a native macOS process with Metal and MLX.
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: virtual-kubelet.io/provider
+      operator: Equal
+      value: darwin
+      effect: NoSchedule
+  restartPolicy: Never
+  containers:
+    - name: eval
+      image: registry.example.com/ml/mlx-eval:1   # a darwin/arm64 image
+      env:
+        # Mac pods share the node's network, so the VM's forwarded port is
+        # on localhost. Cluster DNS names need P5's pod networking.
+        - name: DATABASE_URL
+          value: postgres://postgres@127.0.0.1:5432/postgres
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef: {name: evaldb, key: POSTGRES_PASSWORD}
+      resources:
+        limits:
+          mlx.k3sm.io/gpu: "1"
+          memory: 16Gi
