@@ -5,9 +5,9 @@ Part of #1. Host: MacBook Pro M1 Max (32 GiB), macOS 26.5.1, Go 1.26.1. Run as a
 ## Reproduce
 
 ```sh
-./fetch-deps.sh                                        # pinned runtimed + apis checkouts
+../../hack/fetch-deps.sh                               # pinned runtimed + apis checkouts (repo root third_party/)
 CGO_ENABLED=1 go build -o bin/p0 .
-(cd third_party/runtimed && CGO_ENABLED=1 go build -o ../../bin/k3sm-execshim ./cmd/k3sm-execshim)
+(cd ../../third_party/runtimed && CGO_ENABLED=1 go build -o ../../spike/p0/bin/k3sm-execshim ./cmd/k3sm-execshim)
 ./bin/p0                                               # runtime info + native pod
 
 # OCI + GPU

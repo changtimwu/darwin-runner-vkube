@@ -28,7 +28,7 @@ const (
 )
 
 // configureNode fills in the node object virtual-kubelet registers.
-func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool) {
+func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, runtimeVersion string) {
 	n.Labels["kubernetes.io/os"] = "darwin"
 	n.Labels["kubernetes.io/arch"] = runtime.GOARCH
 	n.Labels["node.kubernetes.io/instance-type"] = "darwin-vk"
@@ -62,7 +62,7 @@ func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool) {
 		OSImage:                 "macOS " + strings.TrimSpace(string(osVersion)),
 		KernelVersion:           kernel,
 		KubeletVersion:          kubeletVersion,
-		ContainerRuntimeVersion: "process://darwin",
+		ContainerRuntimeVersion: runtimeVersion,
 	}
 }
 

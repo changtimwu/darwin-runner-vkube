@@ -1,3 +1,4 @@
 /bin/
 *.kubeconfig
 cluster-ca.crt
+/third_party/

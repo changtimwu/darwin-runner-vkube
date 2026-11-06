@@ -13,7 +13,7 @@ spec:
   restartPolicy: Always
   containers:
     - name: hello
-      image: host            # ignored: containers run as native macOS processes
+      image: native          # host binary (absolute command); or a darwin/arm64 OCI image
       command: ["/bin/sh", "-c"]
       args: ["while true; do echo \"hello from $(sw_vers -productVersion) $(uname -m) ($GREETING)\"; sleep 5; done"]
       env:

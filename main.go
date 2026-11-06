@@ -28,11 +28,19 @@ func main() {
 	hostname, _ := os.Hostname()
 	hostname = strings.ToLower(strings.TrimSuffix(hostname, ".local"))
 	home, _ := os.UserHomeDir()
+	defaultDataDir := filepath.Join(home, ".darwin-vk")
+	if os.Geteuid() == 0 {
+		defaultDataDir = "/var/lib/darwin-vk"
+	}
 
 	var (
 		nodeName    = flag.String("nodename", hostname, "Kubernetes node name")
 		kubeconfig  = flag.String("kubeconfig", os.Getenv("KUBECONFIG"), "path to kubeconfig for the cluster")
-		dataDir     = flag.String("data-dir", filepath.Join(home, ".darwin-vk"), "directory for pod working dirs and logs")
+		dataDir     = flag.String("data-dir", defaultDataDir, "directory for images, pod dirs and logs")
+		runtimeKind = flag.String("runtime", "runtimed", "pod runtime: runtimed (Seatbelt-confined, OCI images) or process (unconfined host processes)")
+		podUser     = flag.String("pod-user", "_darwinvk", "when running as root, the user pods without a securityContext run as")
+		rootPods    = flag.Bool("allow-root-pods", false, "when running as root without --pod-user, let pods run as root (inside Seatbelt)")
+		sigPolicy   = flag.String("signature-policy", "adhoc-ok", "image binary signature policy: adhoc-ok, require-signed or require-notarized")
 		nodeIP      = flag.String("node-ip", "", "IP advertised for the node and its pods (default: auto-detect)")
 		listen      = flag.String("listen", ":10250", "kubelet API listen address (logs/exec/port-forward)")
 		tlsCert     = flag.String("tls-cert", "", "kubelet API serving cert (default: self-signed)")
@@ -60,6 +68,7 @@ func main() {
 		nodeName: *nodeName, kubeconfig: *kubeconfig, dataDir: *dataDir, nodeIP: *nodeIP,
 		listen: *listen, tlsCert: *tlsCert, tlsKey: *tlsKey, clientCA: *clientCA,
 		insecureAPI: *insecureAPI, maxPods: *maxPods, taint: *taint,
+		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, logger: logger,
 	}); err != nil {
 		log.G(ctx).WithError(err).Error("exiting")
 		os.Exit(1)
@@ -68,8 +77,10 @@ func main() {
 
 type options struct {
 	nodeName, kubeconfig, dataDir, nodeIP, listen, tlsCert, tlsKey, clientCA string
-	insecureAPI, taint                                                       bool
+	runtime, podUser, sigPolicy                                              string
+	insecureAPI, taint, rootPods                                             bool
 	maxPods                                                                  int
+	logger                                                                   *slog.Logger
 }
 
 func run(ctx context.Context, o options) error {
@@ -91,13 +102,29 @@ func run(ctx context.Context, o options) error {
 	serveAPI := o.clientCA != "" || o.insecureAPI
 	mux := http.NewServeMux()
 
-	newProvider := func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
-		p, err := NewProvider(o.nodeName, ip, o.dataDir, !serveAPI)
-		if err != nil {
-			return nil, nil, err
+	var newProvider nodeutil.NewProviderFunc
+	switch o.runtime {
+	case "process":
+		newProvider = func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
+			p, err := NewProvider(o.nodeName, ip, o.dataDir, !serveAPI)
+			if err != nil {
+				return nil, nil, err
+			}
+			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, "process://darwin")
+			return p, nil, nil
 		}
-		configureNode(cfg.Node, ip, port, o.maxPods, o.taint)
-		return p, nil, nil
+	case "runtimed":
+		p, err := newRuntimedProvider(ctx, client, o, ip)
+		if err != nil {
+			return err
+		}
+		defer p.Close()
+		newProvider = func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
+			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, "runtimed://k3sm-runtimed")
+			return p, nil, nil
+		}
+	default:
+		return fmt.Errorf("unknown --runtime %q", o.runtime)
 	}
 
 	opts := []nodeutil.NodeOpt{

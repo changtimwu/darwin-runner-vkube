@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # runtimed cannot be consumed through the module proxy (its internal/execshim/nul.go
-# makes the module zip invalid), so the spike builds against pinned local checkouts.
+# makes the module zip invalid), so we build against pinned local checkouts in third_party/.
 set -euo pipefail
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 pin() { # repo commit
   local dir=third_party/$1
   [ -d "$dir/.git" ] || git clone -q "https://github.com/k3sm-io/$1" "$dir"

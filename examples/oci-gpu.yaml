@@ -1,0 +1,19 @@
+# A darwin/arm64 OCI image that asks for the Mac's GPU. It schedules only once
+# the node advertises mlx.k3sm.io/gpu (P3); allow_gpu is already honoured.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metal-probe
+spec:
+  nodeSelector:
+    kubernetes.io/os: darwin
+  tolerations:
+    - key: virtual-kubelet.io/provider
+      operator: Exists
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: localhost:5050/metal-probe:p0   # built by spike/p0/testimage
+      resources:
+        limits:
+          mlx.k3sm.io/gpu: 1

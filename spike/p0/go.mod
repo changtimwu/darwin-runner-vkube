@@ -5,8 +5,8 @@ go 1.26.1
 // k3sm.io modules are unpublished and runtimed cannot be zipped by the module
 // proxy; build against the pinned checkouts that fetch-deps.sh creates.
 replace (
-	k3sm.io/apis => ./third_party/apis
-	k3sm.io/runtimed => ./third_party/runtimed
+	k3sm.io/apis => ../../third_party/apis
+	k3sm.io/runtimed => ../../third_party/runtimed
 )
 
 require (
