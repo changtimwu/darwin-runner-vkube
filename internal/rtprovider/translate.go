@@ -45,6 +45,10 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 			AllowGpu:       requestsGPU(pod),
 		},
 		TerminationGracePeriodSeconds: 30,
+		MemoryLimitBytes:              podMemoryLimit(pod),
+	}
+	if _, ok := pod.Annotations[runtimev1.AnnotationXcodeToolchain]; ok {
+		box.SandboxProfile.XcodeToolchainDir = p.developerDir
 	}
 	if g := pod.Spec.TerminationGracePeriodSeconds; g != nil {
 		box.TerminationGracePeriodSeconds = *g

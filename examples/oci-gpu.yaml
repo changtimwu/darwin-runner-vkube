@@ -1,9 +1,32 @@
-# A darwin/arm64 OCI image that asks for the Mac's GPU. It schedules only once
-# the node advertises mlx.k3sm.io/gpu (P3); allow_gpu is already honoured.
+# Two copies of the same darwin/arm64 Metal probe (built by spike/p0/testimage).
+# Only the pod that requests mlx.k3sm.io/gpu gets Metal in its sandbox:
+#   metal-probe         -> "vector add ... on GPU: OK", Succeeded
+#   metal-probe-denied  -> "FAIL: no Metal device", Failed (exit 2)
+# A GPU pod must set a memory limit: the node fits GPU pods against its GPU
+# memory ceiling and refuses one it cannot measure.
 apiVersion: v1
 kind: Pod
 metadata:
   name: metal-probe
+spec:
+  nodeSelector:
+    mlx.k3sm.io/gpu.present: "true"
+  tolerations:
+    - key: virtual-kubelet.io/provider
+      operator: Exists
+  restartPolicy: Never
+  containers:
+    - name: probe
+      image: localhost:5050/metal-probe:p0
+      resources:
+        limits:
+          mlx.k3sm.io/gpu: 1
+          memory: 1Gi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: metal-probe-denied
 spec:
   nodeSelector:
     kubernetes.io/os: darwin
@@ -13,7 +36,7 @@ spec:
   restartPolicy: Never
   containers:
     - name: probe
-      image: localhost:5050/metal-probe:p0   # built by spike/p0/testimage
+      image: localhost:5050/metal-probe:p0
       resources:
         limits:
-          mlx.k3sm.io/gpu: 1
+          memory: 1Gi

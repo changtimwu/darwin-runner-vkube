@@ -55,6 +55,7 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 		PodUID:          uid,
 		PodGID:          gid,
 		SignaturePolicy: policy,
+		DisableGPU:      o.noGPU,
 		Logger:          o.logger,
 	}, existing)
 }

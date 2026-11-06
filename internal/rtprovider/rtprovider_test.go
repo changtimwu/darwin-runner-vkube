@@ -3,18 +3,24 @@ package rtprovider
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	mlxv1alpha1 "k3sm.io/apis/mlx/v1alpha1"
 	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"github.com/changtimwu/darwin-runner-vkube/internal/gpu"
 )
 
 func testPod(policy corev1.RestartPolicy, ctrs ...corev1.Container) *corev1.Pod {
@@ -55,6 +61,15 @@ func TestPodBox(t *testing.T) {
 
 	if _, err := p.podBox(testPod("", corev1.Container{Name: "x", Image: "native"})); err == nil {
 		t.Error("native image without command accepted")
+	}
+
+	p.developerDir = "/Applications/Xcode.app/Contents/Developer"
+	if box.GetSandboxProfile().GetXcodeToolchainDir() != "" {
+		t.Error("toolchain granted without the annotation")
+	}
+	pod.Annotations = map[string]string{runtimev1.AnnotationXcodeToolchain: ""}
+	if box, _ = p.podBox(pod); box.GetSandboxProfile().GetXcodeToolchainDir() != p.developerDir {
+		t.Error("xcode-toolchain annotation not granted")
 	}
 }
 
@@ -152,5 +167,71 @@ func TestCRILog(t *testing.T) {
 	}
 	if _, err := previousLog("/d/c/0.log"); err == nil {
 		t.Error("previousLog of first instance should fail")
+	}
+}
+
+func gpuPod(uid, mem string) *corev1.Pod {
+	c := corev1.Container{Name: "c", Image: "localhost:5050/x:1",
+		Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{mlxv1alpha1.ResourceGPU: resource.MustParse("1")}}}
+	if mem != "" {
+		c.Resources.Limits[corev1.ResourceMemory] = resource.MustParse(mem)
+	}
+	pod := testPod(corev1.RestartPolicyNever, c)
+	pod.UID = types.UID(uid)
+	return pod
+}
+
+func TestAdmitGPU(t *testing.T) {
+	p := &Provider{cfg: Config{Root: "/r"}, pods: map[string]*tracked{}}
+	admit := func(pod *corev1.Pod) error {
+		box, err := p.podBox(pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.admitGPU(pod, box); err != nil {
+			return err
+		}
+		p.pods[string(pod.UID)] = &tracked{pod: pod}
+		return nil
+	}
+
+	if err := admit(gpuPod("a", "1Gi")); !errdefs.IsInvalidInput(err) {
+		t.Fatalf("GPU pod on a node without a GPU: %v", err)
+	}
+	if err := admit(testPod("", corev1.Container{Name: "c", Image: "x"})); err != nil {
+		t.Fatalf("non-GPU pod refused: %v", err)
+	}
+
+	p.gpu = &runtimev1.GPUFacts{MetalAvailable: true, SandboxGpuSupported: true, RecommendedMaxWorkingSetBytes: 3 << 30}
+	if err := admit(gpuPod("a", "")); !errdefs.IsInvalidInput(err) || !strings.Contains(err.Error(), "memory limit") {
+		t.Fatalf("pod without a memory limit: %v", err)
+	}
+	if err := admit(gpuPod("a", "2Gi")); err != nil {
+		t.Fatalf("first pod: %v", err)
+	}
+	if err := admit(gpuPod("b", "2Gi")); !errors.Is(err, gpu.ErrOverCeiling) || errdefs.IsInvalidInput(err) {
+		t.Fatalf("second pod should be a retryable over-ceiling refusal: %v", err)
+	}
+	p.pods["a"].status = &runtimev1.PodStatus{ContainerStatuses: []*runtimev1.ContainerStatus{exited(0)}}
+	if err := admit(gpuPod("b", "2Gi")); err != nil {
+		t.Fatalf("finished pod still holds GPU memory: %v", err)
+	}
+}
+
+func TestPodMemoryLimit(t *testing.T) {
+	lim := func(q string) corev1.ResourceRequirements {
+		return corev1.ResourceRequirements{Limits: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse(q)}}
+	}
+	pod := testPod("", corev1.Container{Name: "a", Resources: lim("1Gi")}, corev1.Container{Name: "b", Resources: lim("512Mi")})
+	if got := podMemoryLimit(pod); got != 1536<<20 {
+		t.Errorf("sum: %d", got)
+	}
+	pod.Spec.InitContainers = []corev1.Container{{Name: "i", Resources: lim("2Gi")}}
+	if got := podMemoryLimit(pod); got != 2<<30 {
+		t.Errorf("init max: %d", got)
+	}
+	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "u"})
+	if got := podMemoryLimit(pod); got != 0 {
+		t.Errorf("unbounded container: %d", got)
 	}
 }

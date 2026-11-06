@@ -46,7 +46,7 @@ flowchart LR
 | Node | `kubernetes.io/os=darwin`, real CPU/memory capacity, tainted `virtual-kubelet.io/provider=darwin:NoSchedule` |
 | Container image | A `darwin/arm64` OCI image pulled, digest-pinned and unpacked with APFS `clonefile`. Unsigned binaries are ad-hoc signed. Or `image: native` with an absolute host `command`. |
 | Isolation | A generated default-deny Seatbelt profile per pod: the pod can write only its own data dir, the user's home is denied, and so are other pods. As root, pods also drop to a dedicated `_darwinvk` user. |
-| GPU | A `mlx.k3sm.io/gpu` limit adds Metal (AGX/IOSurface) access to that pod's sandbox |
+| GPU | The node advertises `mlx.k3sm.io/gpu` plus chip and memory labels. A pod that requests it gets Metal (AGX/IOSurface) access in its sandbox; other pods are denied. See [GPU pods](#gpu-pods). |
 | `restartPolicy` | `Always` / `OnFailure` / `Never`, with CrashLoopBackOff (10s doubling to 5m) |
 | Logs | CRI-format files; `kubectl logs` with `-f`, `--tail`, `--previous`, `--timestamps`, `--since` |
 | `kubectl exec` | Re-enters the pod's sandbox and identity. TTY, stdin and exit codes are supported. |
@@ -64,7 +64,7 @@ The roadmap and design notes are in [issue #1](https://github.com/changtimwu/dar
 | P0 | ✅ | Spike: runtimed in-process, OCI pull, GPU in sandbox ([findings](spike/p0/FINDINGS.md)) |
 | P1 | ✅ | runtimed-backed provider: lifecycle, restarts, logs, exec, port-forward, stats, re-attach, LaunchDaemon |
 | P2 | ⏳ | OCI polish: `imagePullSecrets`, HTTPS registries, signature policy, image GC |
-| P3 | ⏳ | GPU advertisement (`mlx.k3sm.io/gpu` capacity and labels) |
+| P3 | ✅ | GPU advertisement (`mlx.k3sm.io/gpu` capacity and labels), GPU memory admission, Xcode toolchain opt-in |
 | P4 | ⏳ | Volumes, probes, memory limits / `OOMKilled` |
 | P5 | ⏳ | Linux images through the `vm` RuntimeClass; routable pod networking and cluster DNS |
 
@@ -121,6 +121,28 @@ To run your own image, build a `darwin/arm64` binary and package it as an OCI im
 - Start the k3s server with `--egress-selector-mode disabled`. Otherwise the API server sends kubelet traffic through the k3s agent tunnel, which `darwin-vk` doesn't speak, and `logs`/`exec` fail with 502.
 - k3s verifies kubelet serving certificates. Issue `--tls-cert`/`--tls-key` signed by `/var/lib/rancher/k3s/server/tls/server-ca.{crt,key}`, with the Mac's IP in the SAN.
 
+## GPU pods
+
+At startup runtimed probes the GPU (it opens the Metal device and runs a kernel). If Metal works and the sandbox can grant it, the node advertises:
+
+| | Example (M1 Max, 32 GB) | |
+|---|---|---|
+| `mlx.k3sm.io/gpu` (capacity) | `2` | GPU memory slots: one per 1.5 GiB of usable GPU memory, at least 1 and at most 2. Slots share one integrated GPU; they are not separate devices. |
+| `mlx.k3sm.io/gpu.present` | `true` | For `nodeSelector` |
+| `mlx.k3sm.io/chip` / `chip-family` | `apple-m1-max` / `m1` | Select an exact chip or a generation |
+| `mlx.k3sm.io/memory-gb` | `32` | Unified memory in whole GiB |
+
+These are the same keys and slot arithmetic [k3sm](https://github.com/k3sm-io/k3sm) uses, so a workload can target either kind of Mac node. Without a usable GPU, or with `--disable-gpu`, the node advertises none of them, and a restart removes them.
+
+A GPU pod must set a memory limit on every container. The node adds up the limits of its running GPU pods and checks them against the GPU memory ceiling (the smaller of Metal's recommended working set and the iogpu wired limit):
+
+- **No memory limit**, or **no GPU on this node**: the pod is `Failed` with reason `AdmissionRejected`, as the kubelet does on an admission failure.
+- **Doesn't fit next to the running GPU pods**: the pod stays `Pending` (`ProviderFailed`) and starts once another GPU pod ends.
+
+`examples/oci-gpu.yaml` runs the same Metal probe twice. The pod with the limit computes on the GPU and the pod without it gets no Metal device.
+
+**Xcode toolchain:** the annotation `k3sm.io/xcode-toolchain: ""` gives a pod read access to the Xcode developer directory (`xcode-select -p`) for builds. It needs a full Xcode install. On a Command Line Tools-only Mac it grants nothing, because those tools are already readable.
+
 ## Flags
 
 | Flag | Default | |
@@ -137,6 +159,7 @@ To run your own image, build a `darwin/arm64` binary and package it as an OCI im
 | `--allow-root-pods` | false | As root, allow pods to run as root (still sandboxed) |
 | `--signature-policy` | `adhoc-ok` | `adhoc-ok`, `require-signed` or `require-notarized` |
 | `--max-pods` | 20 | Advertised pod capacity |
+| `--disable-gpu` | false | Don't advertise the GPU, and reject pods that request it |
 | `--taint` | true | Add the NoSchedule taint |
 
 If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays off. Pods still run, but `logs`, `exec` and `port-forward` are unavailable.

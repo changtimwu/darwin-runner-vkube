@@ -42,7 +42,10 @@ type Config struct {
 	PodUID, PodGID uint32
 	// SignaturePolicy is enforced on image binaries before exec.
 	SignaturePolicy runtimev1.SignaturePolicy
-	Logger          *slog.Logger
+	// DisableGPU withholds the GPU: the node advertises none and GPU pods are
+	// refused, even when the host has one.
+	DisableGPU bool
+	Logger     *slog.Logger
 }
 
 // Provider implements nodeutil.Provider and node.PodNotifier on top of runtimed.
@@ -56,6 +59,12 @@ type Provider struct {
 	conn   *grpc.ClientConn
 	stop   context.CancelFunc
 	served chan struct{}
+
+	// Fixed at startup, like runtimed's own probe: podBox must be
+	// deterministic for re-attach, and the node advertises what admission
+	// enforces.
+	gpu          *runtimev1.GPUFacts // nil when unknown or disabled
+	developerDir string              // granted by the xcode-toolchain annotation; "" grants nothing
 
 	mu     sync.Mutex
 	pods   map[string]*tracked // keyed by pod UID (the runtimed pod_id)
@@ -95,6 +104,10 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 		return nil, fmt.Errorf("start runtimed: %w", err)
 	}
 	p := &Provider{cfg: cfg, log: cfg.Logger, rt: rt, pods: map[string]*tracked{}, served: make(chan struct{})}
+	if info, err := rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{}); err == nil && !cfg.DisableGPU {
+		p.gpu = info.GetGpu()
+	}
+	p.developerDir = developerDir(p.log)
 
 	p.reattach(ctx, existing)
 	p.pruneLogDirs(existing)
@@ -134,10 +147,9 @@ func (p *Provider) Close() {
 	}
 }
 
-// RuntimeInfo reports runtimed's health and host capabilities (GPU facts).
-func (p *Provider) RuntimeInfo(ctx context.Context) (*runtimev1.GetRuntimeInfoResponse, error) {
-	return p.rt.GetRuntimeInfo(ctx, &runtimev1.GetRuntimeInfoRequest{})
-}
+// GPUFacts is what the node advertises and admission enforces: runtimed's
+// probe at startup, or nil when the GPU is unknown or disabled.
+func (p *Provider) GPUFacts() *runtimev1.GPUFacts { return p.gpu }
 
 // reattach adopts the still-running processes of pods bound to this node.
 // Anything runtimed refuses is left for virtual-kubelet to create again.
@@ -192,6 +204,21 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	t := &tracked{pod: pod.DeepCopy()}
 	p.mu.Lock()
+	if err := p.admitGPU(pod, box); err != nil {
+		if !errdefs.IsInvalidInput(err) {
+			p.mu.Unlock()
+			return err // retried until it fits
+		}
+		// Rejected for good, as the kubelet does: Failed releases the
+		// scheduler's slot, where a Pending retry would hold it forever.
+		t.final = true
+		t.pod.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "AdmissionRejected", Message: err.Error()}
+		p.pods[box.GetPodId()] = t
+		p.mu.Unlock()
+		p.log.Info("pod rejected", "pod", key(pod), "err", err)
+		p.emit(t.pod.DeepCopy())
+		return nil
+	}
 	p.pods[box.GetPodId()] = t
 	p.mu.Unlock()
 

@@ -19,6 +19,10 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/tools/clientcmd"
+
+	runtimev1 "k3sm.io/apis/runtime/v1"
+
+	"github.com/changtimwu/darwin-runner-vkube/internal/gpu"
 )
 
 const (
@@ -28,7 +32,8 @@ const (
 )
 
 // configureNode fills in the node object virtual-kubelet registers.
-func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, runtimeVersion string) {
+// gpuFacts is nil for runtimes that cannot grant the GPU.
+func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, runtimeVersion string, gpuFacts *runtimev1.GPUFacts) {
 	n.Labels["kubernetes.io/os"] = "darwin"
 	n.Labels["kubernetes.io/arch"] = runtime.GOARCH
 	n.Labels["node.kubernetes.io/instance-type"] = "darwin-vk"
@@ -46,6 +51,7 @@ func configureNode(n *v1.Node, ip string, port int32, maxPods int, taint bool, r
 	}
 	n.Status.Capacity = capacity
 	n.Status.Allocatable = capacity.DeepCopy()
+	gpu.Apply(n, gpuFacts)
 
 	hostname := n.Name
 	n.Status.Addresses = []v1.NodeAddress{

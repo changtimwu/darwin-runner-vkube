@@ -22,6 +22,8 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/node/api"
 	"github.com/virtual-kubelet/virtual-kubelet/node/nodeutil"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
+
+	"github.com/changtimwu/darwin-runner-vkube/internal/gpu"
 )
 
 func main() {
@@ -49,6 +51,7 @@ func main() {
 		insecureAPI = flag.Bool("insecure-no-auth", false, "serve kubelet API without auth when --client-ca is unset (DANGEROUS: grants host exec)")
 		maxPods     = flag.Int("max-pods", 20, "pod capacity advertised by the node")
 		taint       = flag.Bool("taint", true, "taint node with virtual-kubelet.io/provider=darwin:NoSchedule")
+		noGPU       = flag.Bool("disable-gpu", false, "do not advertise the GPU, and refuse pods that request "+string(gpu.ResourceName))
 		debug       = flag.Bool("debug", false, "debug logging")
 	)
 	flag.Parse()
@@ -68,7 +71,7 @@ func main() {
 		nodeName: *nodeName, kubeconfig: *kubeconfig, dataDir: *dataDir, nodeIP: *nodeIP,
 		listen: *listen, tlsCert: *tlsCert, tlsKey: *tlsKey, clientCA: *clientCA,
 		insecureAPI: *insecureAPI, maxPods: *maxPods, taint: *taint,
-		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, logger: logger,
+		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, noGPU: *noGPU, logger: logger,
 	}); err != nil {
 		log.G(ctx).WithError(err).Error("exiting")
 		os.Exit(1)
@@ -78,7 +81,7 @@ func main() {
 type options struct {
 	nodeName, kubeconfig, dataDir, nodeIP, listen, tlsCert, tlsKey, clientCA string
 	runtime, podUser, sigPolicy                                              string
-	insecureAPI, taint, rootPods                                             bool
+	insecureAPI, taint, rootPods, noGPU                                      bool
 	maxPods                                                                  int
 	logger                                                                   *slog.Logger
 }
@@ -110,7 +113,7 @@ func run(ctx context.Context, o options) error {
 			if err != nil {
 				return nil, nil, err
 			}
-			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, "process://darwin")
+			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, "process://darwin", nil)
 			return p, nil, nil
 		}
 	case "runtimed":
@@ -120,7 +123,7 @@ func run(ctx context.Context, o options) error {
 		}
 		defer p.Close()
 		newProvider = func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
-			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, "runtimed://k3sm-runtimed")
+			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, "runtimed://k3sm-runtimed", p.GPUFacts())
 			return p, nil, nil
 		}
 	default:
