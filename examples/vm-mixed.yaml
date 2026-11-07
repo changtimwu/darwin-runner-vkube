@@ -27,6 +27,20 @@ spec:
   containers:
     - name: postgres
       image: postgres:17-alpine
+      # The image's entrypoint passes initdb its password through bash process
+      # substitution, and the VM guest has no /dev/fd, so initialise directly.
+      command: [sh, -c]
+      args:
+        - |
+          set -e
+          if [ ! -s "$PGDATA/PG_VERSION" ]; then
+            install -d -o postgres -g postgres -m 700 "$PGDATA"
+            printf '%s' "$POSTGRES_PASSWORD" > /tmp/pwfile && chown postgres /tmp/pwfile
+            gosu postgres initdb -U postgres --pwfile=/tmp/pwfile --auth-host=scram-sha-256
+            rm /tmp/pwfile
+            echo "host all all all scram-sha-256" >> "$PGDATA/pg_hba.conf"
+          fi
+          exec gosu postgres postgres -c listen_addresses='*'
       envFrom:
         - secretRef: {name: evaldb}
       ports:
@@ -56,8 +70,9 @@ spec:
     - name: eval
       image: registry.example.com/ml/mlx-eval:1   # a darwin/arm64 image
       env:
-        # Mac pods share the node's network, so the VM's forwarded port is
-        # on localhost. Cluster DNS names need P5's pod networking.
+        # Without --pod-network, Mac pods share the node's network, so the
+        # VM's forwarded port is on localhost. With --pod-network=flannel, use
+        # postgres://postgres@evaldb:5432/postgres instead.
         - name: DATABASE_URL
           value: postgres://postgres@127.0.0.1:5432/postgres
         - name: PGPASSWORD
