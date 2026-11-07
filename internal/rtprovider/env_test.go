@@ -3,6 +3,7 @@ package rtprovider
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -146,5 +147,40 @@ func TestExpand(t *testing.T) {
 		if got := expand(in, lookup); got != want {
 			t.Errorf("expand(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// recordingNetwork hands out one IP per pod and records releases.
+type recordingNetwork struct {
+	PodNetwork
+	live map[string]bool
+}
+
+func (n *recordingNetwork) Setup(_ context.Context, podID string) (string, error) {
+	n.live[podID] = true
+	return "10.42.1.7", nil
+}
+
+func (n *recordingNetwork) Teardown(podID string) error {
+	delete(n.live, podID)
+	return nil
+}
+
+func TestCreatePodReleasesIPWhileEnvIsMissing(t *testing.T) {
+	net := &recordingNetwork{live: map[string]bool{}}
+	p := &Provider{
+		cfg: Config{NodeName: "mac", NodeIP: "172.16.2.143", Root: t.TempDir(), Client: fake.NewSimpleClientset(), Network: net},
+		log: slog.New(slog.DiscardHandler),
+	}
+	pod := testPod(corev1.RestartPolicyAlways, corev1.Container{
+		Name: "app", Image: "native", Command: []string{"/bin/true"},
+		EnvFrom: []corev1.EnvFromSource{{ConfigMapRef: &corev1.ConfigMapEnvSource{LocalObjectReference: corev1.LocalObjectReference{Name: "later"}}}},
+	})
+	if err := p.CreatePod(context.Background(), pod); !errors.As(err, new(envError)) {
+		t.Fatalf("CreatePod = %v; want a retried env error", err)
+	}
+	// The pod is untracked until the retry, so DeletePod could not free it.
+	if len(net.live) != 0 {
+		t.Errorf("IP still held for a Pending pod: %v", net.live)
 	}
 }
