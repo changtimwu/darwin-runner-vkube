@@ -58,6 +58,18 @@ func TestPodBox(t *testing.T) {
 	if box.GetUid() != 300 || box.GetPodIp() != "10.0.0.5" || box.GetLogDirectory() != "/logs/ns_p_"+string(pod.UID) {
 		t.Errorf("identity/ip/log dir wrong: %v", box)
 	}
+	if got := box.GetPodSecurityContext().GetFsGroup(); got != 300 {
+		t.Errorf("fsGroup = %d, want the pod user's group so it can write its volumes", got)
+	}
+	fsg := int64(500)
+	pod.Spec.SecurityContext = &corev1.PodSecurityContext{FSGroup: &fsg}
+	if box, _ := p.podBox(pod); box.GetPodSecurityContext().GetFsGroup() != 500 {
+		t.Error("explicit fsGroup overridden")
+	}
+	pod.Spec.SecurityContext = nil
+	if box, _ := (&Provider{cfg: Config{Root: "/r"}}).podBox(pod); box.GetPodSecurityContext().GetFsGroup() != 0 {
+		t.Error("fsGroup set when pods do not drop privileges")
+	}
 
 	if _, err := p.podBox(testPod("", corev1.Container{Name: "x", Image: "native"})); err == nil {
 		t.Error("native image without command accepted")

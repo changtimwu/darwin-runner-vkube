@@ -82,6 +82,16 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 			FsGroup:    deref(sc.FSGroup),
 		}
 	}
+	if box.Gid != 0 && box.GetPodSecurityContext().GetFsGroup() == 0 {
+		// runtimed leaves the pod's tree root-owned, so a dropped pod user
+		// could not write its volumes. The kubelet makes emptyDir world
+		// writable; granting the pod user's group via fsGroup is the narrower
+		// equivalent. vm pods have Gid 0, as they refuse fsGroup.
+		if box.PodSecurityContext == nil {
+			box.PodSecurityContext = &runtimev1.PodSecurityContext{}
+		}
+		box.PodSecurityContext.FsGroup = int64(box.Gid)
+	}
 	if box.Volumes, err = toVolumes(pod.Spec.Volumes); err != nil {
 		return nil, err
 	}
