@@ -1,6 +1,7 @@
 package rtprovider
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
@@ -63,6 +64,12 @@ func TestVMSizing(t *testing.T) {
 	}
 	if v, m := vmSizing(&corev1.Pod{}); v != 0 || m != 0 {
 		t.Errorf("no limits = %d, %d; want backend defaults", v, m)
+	}
+}
+
+func TestGuestNetworkGivesNativePodsTheNodeIP(t *testing.T) {
+	if ip, err := newGuestNetwork("192.168.1.101").Setup(context.Background(), "p"); err != nil || ip != "192.168.1.101" {
+		t.Errorf("Setup = %q, %v; want the node IP", ip, err)
 	}
 }
 

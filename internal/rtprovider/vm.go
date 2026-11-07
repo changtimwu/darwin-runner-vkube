@@ -85,7 +85,8 @@ type guestNetwork struct {
 
 func newGuestNetwork(nodeIP string) guestNetwork {
 	ip, _ := netip.ParseAddr(nodeIP)
-	return guestNetwork{nodeIP: ip, nameservers: hostNameservers("/etc/resolv.conf")}
+	// Native pods get the node IP too; NodeNetwork's zero value is loopback.
+	return guestNetwork{NodeNetwork: supervisor.NodeNetwork{IP: nodeIP}, nodeIP: ip, nameservers: hostNameservers("/etc/resolv.conf")}
 }
 
 func (g guestNetwork) GuestNetwork(string) (sandbox.GuestNetworkConfig, bool) {
