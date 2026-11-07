@@ -30,6 +30,8 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/runtime"
+
+	"github.com/changtimwu/darwin-runner-vkube/internal/hoststats"
 )
 
 // Config configures a Provider.
@@ -79,6 +81,8 @@ type Provider struct {
 	// enforces.
 	gpu          *runtimev1.GPUFacts // nil when unknown or disabled
 	developerDir string              // granted by the xcode-toolchain annotation; "" grants nothing
+
+	host hoststats.Reader // node-wide CPU/memory for /stats/summary
 
 	mu     sync.Mutex
 	pods   map[string]*tracked // keyed by pod UID (the runtimed pod_id)
