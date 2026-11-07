@@ -169,7 +169,13 @@ func run(ctx context.Context, o options) error {
 		}
 		tlsOpts := []func(*tls.Config) error{certOpt}
 		if o.clientCA != "" {
-			tlsOpts = append(tlsOpts, nodeutil.WithCAFromPath(o.clientCA))
+			// WithCAFromPath requires a client cert, which locks out bearer-token
+			// clients such as metrics-server. Verify a cert if one is sent and let
+			// webhook authn (TokenReview) handle the rest; anonymous stays denied.
+			tlsOpts = append(tlsOpts, nodeutil.WithCAFromPath(o.clientCA), func(c *tls.Config) error {
+				c.ClientAuth = tls.VerifyClientCertIfGiven
+				return nil
+			})
 		}
 		opts = append(opts,
 			nodeutil.WithTLSConfig(tlsOpts...),
