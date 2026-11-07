@@ -318,6 +318,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		// Like the kubelet's CreateContainerConfigError: stay Pending and
 		// retry, as a missing ConfigMap or Secret may appear later.
 		p.event(pod, corev1.EventTypeWarning, "Failed", "Error: %s", err)
+		p.releaseIP(pod)
 		return fmt.Errorf("create pod %s: %w", key(pod), err)
 	}
 	if err != nil {
@@ -325,6 +326,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		return nil
 	}
 	if err := ensureLogDirs(box.GetLogDirectory(), pod); err != nil {
+		p.releaseIP(pod)
 		return err
 	}
 	t.vm = isVM(box)
@@ -332,6 +334,7 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	if err := p.admitGPU(pod, box); err != nil {
 		p.mu.Unlock()
 		if !errdefs.IsInvalidInput(err) {
+			p.releaseIP(pod)
 			return err // retried until it fits
 		}
 		p.reject(t, err)
@@ -359,10 +362,23 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 			reason = "FailedMount"
 		}
 		p.event(pod, corev1.EventTypeWarning, reason, "%s", err)
+		p.releaseIP(pod)
 		return fmt.Errorf("create pod %s: %w", key(pod), err)
 	}
 	p.observe(resp.GetStatus())
 	return nil
+}
+
+// releaseIP frees the IP of a pod CreatePod left Pending for a retry. The pod
+// is not tracked, so DeletePod would not free it if the pod went away before
+// the retry; the retry allocates afresh.
+func (p *Provider) releaseIP(pod *corev1.Pod) {
+	if p.cfg.Network == nil {
+		return
+	}
+	if err := p.cfg.Network.Teardown(string(pod.UID)); err != nil {
+		p.log.Warn("release pod IP", "pod", key(pod), "err", err)
+	}
 }
 
 // reject fails a pod this node can never run, as the kubelet does at
