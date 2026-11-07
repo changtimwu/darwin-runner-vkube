@@ -9,9 +9,10 @@ build: deps
 	cd third_party/runtimed && go build -o ../../bin/k3sm-vmhost ./cmd/k3sm-vmhost
 	codesign --force --sign - --entitlements third_party/runtimed/cmd/k3sm-vmhost/vmhost.entitlements bin/k3sm-vmhost
 	third_party/runtimed/hack/build-pathshim.sh $(CURDIR)/bin
+	third_party/darwin-net/hack/build-shim.sh $(CURDIR)/bin
 
 deps:
-	@test -d third_party/runtimed/.git -a -d third_party/apis/.git || hack/fetch-deps.sh
+	@test -d third_party/runtimed/.git -a -d third_party/apis/.git -a -d third_party/darwin-net/.git || hack/fetch-deps.sh
 
 test: deps
 	go test -race ./ ./internal/...

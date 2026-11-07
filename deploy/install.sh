@@ -39,7 +39,7 @@ if ! id "$POD_USER" >/dev/null 2>&1; then
 fi
 
 install -d -m 755 "$BIN_DIR"
-install -m 755 bin/darwin-vk bin/k3sm-execshim bin/k3sm-vmhost bin/libk3sm_pathrebase_shim.dylib "$BIN_DIR/"
+install -m 755 bin/darwin-vk bin/k3sm-execshim bin/k3sm-vmhost bin/libk3sm_pathrebase_shim.dylib bin/libk3sm_getaddrinfo_shim.dylib "$BIN_DIR/"
 # Re-signed shells and coreutils, so /bin/sh pods see their volume mounts.
 "$BIN_DIR/darwin-vk" install-shadow-bin "$BIN_DIR/shadow-bin"
 install -d -m 700 "$ETC"

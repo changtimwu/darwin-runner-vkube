@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"sync"
@@ -30,6 +31,7 @@ import (
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
 	"k3sm.io/runtimed/pkg/runtime"
+	"k3sm.io/runtimed/pkg/sandbox"
 
 	"github.com/changtimwu/darwin-runner-vkube/internal/hoststats"
 )
@@ -64,7 +66,32 @@ type Config struct {
 	// VMBackend runs pods of the "vm" RuntimeClass in Linux micro-VMs. Nil,
 	// or a backend that is not Available, refuses them.
 	VMBackend runtime.VMBackend
-	Logger    *slog.Logger
+	// Network gives native pods their own IPs, Service VIPs and cluster DNS.
+	// Nil keeps every pod on the node IP.
+	Network PodNetwork
+	// DNSShim is the getaddrinfo DYLD library that resolves cluster names in
+	// native pods. Empty leaves them on the host's resolvers.
+	DNSShim string
+	Logger  *slog.Logger
+}
+
+// PodNetwork is the per-pod network the provider drives: runtimed calls
+// Setup and Teardown, and the provider calls Setup first to learn the IP the
+// pod's environment names.
+type PodNetwork interface {
+	Setup(ctx context.Context, podID string) (string, error)
+	Teardown(podID string) error
+	SetHostNetwork(podID string)
+	Reattach(ctx context.Context, podID string, ip netip.Addr, vm bool, namespace string) (bool, error)
+	Env(podIP netip.Addr, namespace string) map[string]string
+	// SetupGuest, GuestNetwork and SetGuestTransport give vm pods a published
+	// IP whose ports the network relays to the guest's vmnet lease.
+	SetupGuest(ctx context.Context, podID, namespace string) (string, error)
+	GuestNetwork(podID string) (sandbox.GuestNetworkConfig, bool)
+	SetGuestTransport(podID string, live netip.Addr, ports []uint16)
+	// Sweep releases the IPs of pods that did not survive a restart; it runs
+	// once, after re-attach.
+	Sweep(ctx context.Context) error
 }
 
 // Provider implements nodeutil.Provider and node.PodNotifier on top of runtimed.
@@ -142,6 +169,11 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 	p.developerDir = developerDir(p.log)
 
 	p.reattach(ctx, existing)
+	if cfg.Network != nil {
+		if err := cfg.Network.Sweep(ctx); err != nil {
+			p.log.Warn("release IPs of pods that did not survive the restart", "err", err)
+		}
+	}
 	p.pruneLogDirs(existing)
 
 	lis := bufconn.Listen(1 << 20)
@@ -165,7 +197,11 @@ func New(ctx context.Context, cfg Config, existing []*corev1.Pod) (*Provider, er
 }
 
 func (p *Provider) deps() runtime.Deps {
-	d := runtime.Deps{ClusterRegistries: p.cfg.InsecureRegistries, Network: newGuestNetwork(p.cfg.NodeIP)}
+	g := newGuestNetwork(p.cfg.NodeIP)
+	d := runtime.Deps{ClusterRegistries: p.cfg.InsecureRegistries, Network: g}
+	if p.cfg.Network != nil {
+		d.Network = podNetwork{PodNetwork: p.cfg.Network, guest: g}
+	}
 	if p.cfg.VMBackend != nil {
 		d.VMBackend = p.cfg.VMBackend
 	}
@@ -213,7 +249,12 @@ func (p *Provider) reattach(ctx context.Context, pods []*corev1.Pod) {
 		if pod.DeletionTimestamp != nil {
 			continue
 		}
-		box, err := p.podBox(pod)
+		ip, err := p.reattachIP(ctx, pod)
+		if err != nil {
+			p.log.Warn("re-attach: pod IP", "pod", key(pod), "err", err)
+			continue
+		}
+		box, err := p.podBoxAt(pod, ip)
 		if err != nil {
 			p.log.Warn("re-attach: translate", "pod", key(pod), "err", err)
 			continue
@@ -247,7 +288,12 @@ func (p *Provider) pruneLogDirs(existing []*corev1.Pod) {
 // CreatePod materializes the pod's log tree and asks runtimed to start it.
 func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 	t := &tracked{pod: pod.DeepCopy()}
-	box, err := p.podBox(pod)
+	ip, err := p.allocateIP(ctx, pod)
+	if err != nil {
+		p.event(pod, corev1.EventTypeWarning, "FailedCreatePodSandBox", "pod network: %s", err)
+		return fmt.Errorf("create pod %s: %w", key(pod), err)
+	}
+	box, err := p.podBoxAt(pod, ip)
 	if err != nil {
 		p.reject(t, err)
 		return nil
@@ -297,6 +343,9 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 // admission: Failed releases the scheduler's resources, where a Pending retry
 // would hold them forever.
 func (p *Provider) reject(t *tracked, err error) {
+	if p.cfg.Network != nil {
+		_ = p.cfg.Network.Teardown(string(t.pod.UID))
+	}
 	t.final = true
 	t.pod.Status = corev1.PodStatus{Phase: corev1.PodFailed, Reason: "AdmissionRejected", Message: err.Error()}
 	p.mu.Lock()
@@ -365,6 +414,12 @@ func (p *Provider) DeletePod(ctx context.Context, pod *corev1.Pod) error {
 	}
 	if _, err := p.rt.DeletePod(ctx, &runtimev1.DeletePodRequest{PodId: id, GracePeriodSeconds: grace}); err != nil {
 		p.log.Warn("runtimed delete pod", "pod", key(pod), "err", err)
+	}
+	if p.cfg.Network != nil && t.vm {
+		// runtimed releases a native pod's IP itself, but never a vm pod's.
+		if err := p.cfg.Network.Teardown(id); err != nil {
+			p.log.Warn("release vm pod IP", "pod", key(pod), "err", err)
+		}
 	}
 	_ = os.RemoveAll(podLogDir(p.cfg.PodLogsDir, pod))
 

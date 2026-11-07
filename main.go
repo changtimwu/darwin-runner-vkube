@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -62,12 +63,28 @@ func main() {
 		reservedStr  = flag.String("system-reserved", "memory=2Gi", "resources held back from pods for macOS and the desktop, e.g. cpu=1,memory=4Gi")
 		shadowBin    = flag.String("shadow-bin-dir", "", "root-owned dir of re-signed shells/coreutils (see install-shadow-bin), so /bin/sh pods see volume mounts")
 		insecureRegs []string
+		podNetwork   = flag.String("pod-network", "none", "pod networking: none (pods share the node IP) or flannel (each native pod gets its own IP from the node's podCIDR, joined to the cluster's flannel VXLAN network; needs root)")
+		clusterCIDR  = flag.String("cluster-cidr", "10.42.0.0/16", "the cluster's pod CIDR (with --pod-network=flannel)")
+		serviceCIDR  = flag.String("service-cidr", "10.43.0.0/16", "the cluster's Service CIDR (with --pod-network=flannel)")
+		clusterDom   = flag.String("cluster-domain", "cluster.local", "the cluster's DNS domain (with --pod-network=flannel)")
+		vmSubnet     = flag.String("vm-subnet", "192.168.64.0/24", "the vmnet segment micro-VM guests lease addresses from (with --pod-network=flannel)")
+		vxlanEPs     = map[netip.Addr]netip.AddrPort{}
 		noVM         = flag.Bool("disable-vm", false, "refuse pods of the vm RuntimeClass instead of fetching the guest kernel and running micro-VMs")
 		noGPU        = flag.Bool("disable-gpu", false, "do not advertise the GPU, and refuse pods that request "+string(gpu.ResourceName))
 		debug        = flag.Bool("debug", false, "debug logging")
 	)
 	flag.Func("insecure-registry", "registry host[:port] to pull from over plain HTTP; repeatable (loopback and RFC 1918 addresses already are)", func(s string) error {
 		insecureRegs = append(insecureRegs, s)
+		return nil
+	})
+	flag.Func("vxlan-endpoint", "public-ip=host:port: send a flannel peer's VXLAN frames to host:port instead (test topologies such as k3s in Docker Desktop); repeatable", func(s string) error {
+		ipStr, ep, ok := strings.Cut(s, "=")
+		ip, err1 := netip.ParseAddr(ipStr)
+		ap, err2 := netip.ParseAddrPort(ep)
+		if !ok || err1 != nil || err2 != nil {
+			return fmt.Errorf("want public-ip=host:port, got %q", s)
+		}
+		vxlanEPs[ip] = ap
 		return nil
 	})
 	flag.Parse()
@@ -93,6 +110,7 @@ func main() {
 		listen: *listen, tlsCert: *tlsCert, tlsKey: *tlsKey, clientCA: *clientCA,
 		insecureAPI: *insecureAPI, maxPods: *maxPods, taint: *taint,
 		runtime: *runtimeKind, podUser: *podUser, rootPods: *rootPods, sigPolicy: *sigPolicy, noGPU: *noGPU, noVM: *noVM, insecureRegs: insecureRegs, shadowBin: *shadowBin, reserved: reserved, logger: logger,
+		podNetwork: *podNetwork, clusterCIDR: *clusterCIDR, serviceCIDR: *serviceCIDR, clusterDomain: *clusterDom, vmSubnet: *vmSubnet, vxlanEndpoints: vxlanEPs,
 	}); err != nil {
 		log.G(ctx).WithError(err).Error("exiting")
 		os.Exit(1)
@@ -102,6 +120,8 @@ func main() {
 type options struct {
 	nodeName, kubeconfig, dataDir, nodeIP, listen, tlsCert, tlsKey, clientCA string
 	runtime, podUser, sigPolicy, shadowBin                                   string
+	podNetwork, clusterCIDR, serviceCIDR, clusterDomain, vmSubnet            string
+	vxlanEndpoints                                                           map[netip.Addr]netip.AddrPort
 	insecureAPI, taint, rootPods, noGPU, noVM                                bool
 	insecureRegs                                                             []string
 	reserved                                                                 v1.ResourceList

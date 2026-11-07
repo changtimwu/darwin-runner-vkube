@@ -11,3 +11,4 @@ pin() { # repo commit
 }
 pin apis f6ce8a4a981f6b37dd132c4b7a23ce3ccfe02853
 pin runtimed 32fe2ec31ce9c0d524a4fe5034d3f6695595f2ed
+pin darwin-net 669949a3e443de5f5bb9174494813506f23f210d

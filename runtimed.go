@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,6 +21,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
 	typedcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/tools/record"
 
 	runtimev1 "k3sm.io/apis/runtime/v1"
@@ -23,6 +29,7 @@ import (
 	"k3sm.io/runtimed/pkg/runtime"
 	"k3sm.io/runtimed/pkg/sandbox"
 
+	"github.com/changtimwu/darwin-runner-vkube/internal/podnetwork"
 	"github.com/changtimwu/darwin-runner-vkube/internal/rtprovider"
 )
 
@@ -55,6 +62,10 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 	if err != nil {
 		return nil, err
 	}
+	network, err := podNetworkFor(ctx, client, o, ip)
+	if err != nil {
+		return nil, err
+	}
 	root := filepath.Join(dataDir, "runtime")
 	if err := traversablePodsDir(filepath.Join(root, "pods")); err != nil {
 		return nil, err
@@ -74,8 +85,88 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 		ShadowBinDir:       o.shadowBin,
 		Events:             eventRecorder(client, o.nodeName),
 		VMBackend:          vmBackend(ctx, o, root),
+		Network:            network,
+		DNSShim:            dnsShim(network, o.logger),
 		Logger:             o.logger,
 	}, existing)
+}
+
+// podNetworkFor starts the pod network --pod-network asks for, or returns nil
+// (pods keep the node IP).
+func podNetworkFor(ctx context.Context, client kubernetes.Interface, o options, ip string) (rtprovider.PodNetwork, error) {
+	switch o.podNetwork {
+	case "none", "":
+		return nil, nil
+	case "flannel":
+	default:
+		return nil, fmt.Errorf("unknown --pod-network %q (want none or flannel)", o.podNetwork)
+	}
+	if os.Geteuid() != 0 {
+		return nil, errors.New("--pod-network=flannel needs root: it creates a utun and lo0 aliases")
+	}
+	nodeIP, err := netip.ParseAddr(ip)
+	if err != nil {
+		return nil, fmt.Errorf("node IP %q: %w", ip, err)
+	}
+	cfg := podnetwork.Config{
+		Client: client, NodeName: o.nodeName, NodeIP: nodeIP, ClusterDomain: o.clusterDomain,
+		VXLANEndpoints: o.vxlanEndpoints, Logger: o.logger,
+	}
+	if cfg.ClusterCIDR, err = netip.ParsePrefix(o.clusterCIDR); err != nil {
+		return nil, fmt.Errorf("--cluster-cidr: %w", err)
+	}
+	if cfg.ServiceCIDR, err = netip.ParsePrefix(o.serviceCIDR); err != nil {
+		return nil, fmt.Errorf("--service-cidr: %w", err)
+	}
+	if cfg.VMSubnet, err = netip.ParsePrefix(o.vmSubnet); err != nil {
+		return nil, fmt.Errorf("--vm-subnet: %w", err)
+	}
+	cfg.APIServer = loopbackAPIServer(o.kubeconfig)
+	n := podnetwork.New(cfg)
+	n.Start(ctx, 15*time.Second)
+	return n, nil
+}
+
+// loopbackAPIServer is the kubeconfig's apiserver address when it is a
+// loopback one: the endpoint the apiserver advertises is then not reachable
+// from this host, so the kubernetes Service is pinned here instead.
+func loopbackAPIServer(kubeconfig string) netip.AddrPort {
+	cfg, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return netip.AddrPort{}
+	}
+	u, err := url.Parse(cfg.Host)
+	if err != nil {
+		return netip.AddrPort{}
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+	}
+	ap, err := netip.ParseAddrPort(net.JoinHostPort(u.Hostname(), port))
+	if err != nil || !ap.Addr().IsLoopback() {
+		return netip.AddrPort{}
+	}
+	return ap
+}
+
+// dnsShim is the getaddrinfo library installed beside the binary, which
+// resolves cluster names in native pods. Like the path shim it must live
+// outside /Users for pods to load it.
+func dnsShim(network rtprovider.PodNetwork, log *slog.Logger) string {
+	if network == nil {
+		return ""
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	p := filepath.Join(filepath.Dir(exe), "libk3sm_getaddrinfo_shim.dylib")
+	if _, err := os.Stat(p); err != nil || strings.HasPrefix(p, "/Users/") {
+		log.Warn("DNS shim not usable; pods resolve with the host's DNS only (install with deploy/install.sh)", "want", p)
+		return ""
+	}
+	return p
 }
 
 // pathShim is the path-rebase library installed beside the binary, which lets

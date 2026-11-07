@@ -8,9 +8,11 @@ require (
 	github.com/prometheus/client_model v0.6.3
 	github.com/virtual-kubelet/virtual-kubelet v1.14.1
 	golang.org/x/sys v0.49.0
+	golang.zx2c4.com/wireguard v0.0.0-20261006164505-2631ce99a06f
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	k3sm.io/apis v0.0.0-00010101000000-000000000000
+	k3sm.io/darwin-net v0.0.0-00010101000000-000000000000
 	k3sm.io/runtimed v0.0.0-00010101000000-000000000000
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
@@ -109,6 +111,7 @@ require (
 	golang.org/x/term v0.46.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
+	golang.zx2c4.com/wintun v0.0.0-20230126152724-0fa3db229ce2 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260803160001-6ac0973c030d // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260803160001-6ac0973c030d // indirect
 	gopkg.in/evanphx/json-patch.v4 v4.13.0 // indirect
@@ -131,5 +134,6 @@ require (
 // proxy; build against the pinned checkouts that hack/fetch-deps.sh creates.
 replace (
 	k3sm.io/apis => ./third_party/apis
+	k3sm.io/darwin-net => ./third_party/darwin-net
 	k3sm.io/runtimed => ./third_party/runtimed
 )

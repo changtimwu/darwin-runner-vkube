@@ -17,9 +17,15 @@ import (
 // nativeImage is runtimed's sentinel for "command[0] is a host binary".
 const nativeImage = "native"
 
-// podBox translates a Pod into runtimed's PodBox. It must be deterministic:
-// re-attach verifies the compiled sandbox profile against the original spawn.
+// podBox translates a Pod on the node IP into runtimed's PodBox.
 func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
+	return p.podBoxAt(pod, p.cfg.NodeIP)
+}
+
+// podBoxAt translates a Pod with IP podIP into runtimed's PodBox. It must be
+// deterministic: re-attach verifies the compiled sandbox profile against the
+// original spawn.
+func (p *Provider) podBoxAt(pod *corev1.Pod, podIP string) (*runtimev1.PodBox, error) {
 	id := string(pod.UID)
 	if id == "" {
 		return nil, fmt.Errorf("pod %s has no UID", key(pod))
@@ -30,8 +36,8 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 		Name:            pod.Name,
 		Uid:             p.cfg.PodUID,
 		Gid:             p.cfg.PodGID,
-		PodIp:           p.cfg.NodeIP,
-		PodIps:          []string{p.cfg.NodeIP},
+		PodIp:           podIP,
+		PodIps:          []string{podIP},
 		Labels:          pod.Labels,
 		Annotations:     pod.Annotations,
 		SignaturePolicy: p.cfg.SignaturePolicy,
@@ -100,6 +106,9 @@ func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
 	}
 	if box.Containers, err = toContainers(pod.Spec.Containers); err != nil {
 		return nil, err
+	}
+	if backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
+		p.addNetworkEnv(box, pod, podIP)
 	}
 	return box, nil
 }
@@ -203,6 +212,9 @@ func toPodStatus(pod *corev1.Pod, st *runtimev1.PodStatus, nodeIP string, ov ove
 		QOSClass: pod.Status.QOSClass, // computed by the API server at creation
 		Reason:   st.GetReason(),
 		Message:  st.GetMessage(),
+	}
+	if ip := st.GetPodIp(); ip != "" {
+		out.PodIP, out.PodIPs = ip, []corev1.PodIP{{IP: ip}}
 	}
 	if t := st.GetStartTime(); t != nil {
 		out.StartTime = &metav1.Time{Time: t.AsTime()}

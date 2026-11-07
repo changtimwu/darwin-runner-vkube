@@ -25,6 +25,10 @@ rules:
   - apiGroups: [""]
     resources: [configmaps, secrets, services]
     verbs: [get, list, watch]
+  # The Service proxy (--pod-network=flannel) follows each Service's endpoints.
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
   # Resolves a pod's runtimeClassName to its handler (vm).
   - apiGroups: [node.k8s.io]
     resources: [runtimeclasses]

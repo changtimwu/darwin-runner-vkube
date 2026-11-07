@@ -127,6 +127,13 @@ func (p *Provider) syncForward(t *tracked, st *runtimev1.PodStatus) {
 	if !t.vm || addr == "" {
 		return
 	}
+	if p.cfg.Network != nil && st.GetPodIp() != p.cfg.NodeIP {
+		// The pod has its own IP: the network relays it to the guest.
+		if live, err := netip.ParseAddr(addr); err == nil {
+			p.cfg.Network.SetGuestTransport(string(t.pod.UID), live, tcpPorts(t.pod))
+		}
+		return
+	}
 	if t.fwd != nil {
 		t.fwd.mu.Lock()
 		t.fwd.target = addr
@@ -199,16 +206,33 @@ func (f *forwarder) close() {
 }
 
 // probeHost is where http, tcp and grpc probes dial: the guest itself for a
-// vm pod, the node otherwise (native pods share the host's network).
+// vm pod, the pod's own IP for a native pod that has one, the node otherwise.
 func (p *Provider) probeHost(pod *corev1.Pod) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if t, ok := p.pods[string(pod.UID)]; ok && t.vm {
-		if a := t.status.GetGuestTransportAddress(); a != "" {
-			return a
+	if t, ok := p.pods[string(pod.UID)]; ok {
+		if t.vm {
+			if a := t.status.GetGuestTransportAddress(); a != "" {
+				return a
+			}
+		} else if ip := t.status.GetPodIp(); ip != "" {
+			return ip
 		}
 	}
 	return p.cfg.NodeIP
+}
+
+// tcpPorts are the pod's declared TCP container ports.
+func tcpPorts(pod *corev1.Pod) []uint16 {
+	var out []uint16
+	for _, c := range pod.Spec.Containers {
+		for _, port := range c.Ports {
+			if port.Protocol == "" || port.Protocol == corev1.ProtocolTCP {
+				out = append(out, uint16(port.ContainerPort))
+			}
+		}
+	}
+	return out
 }
 
 func isVM(box *runtimev1.PodBox) bool {
