@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -245,5 +246,24 @@ func TestPodMemoryLimit(t *testing.T) {
 	pod.Spec.Containers = append(pod.Spec.Containers, corev1.Container{Name: "u"})
 	if got := podMemoryLimit(pod); got != 0 {
 		t.Errorf("unbounded container: %d", got)
+	}
+}
+
+func TestDiscardPodDir(t *testing.T) {
+	root := t.TempDir()
+	p := &Provider{cfg: Config{Root: root}, log: slog.New(slog.DiscardHandler)}
+	pod := filepath.Join(root, "pods", "uid-1", "rootfs", "etc")
+	if err := os.MkdirAll(pod, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p.discardPodDir("uid-1")
+	if _, err := os.Stat(filepath.Join(root, "pods", "uid-1")); !os.IsNotExist(err) {
+		t.Errorf("pod dir still there: %v", err)
+	}
+	for _, id := range []string{"", "..", "../pods", "a/b"} {
+		p.discardPodDir(id)
+	}
+	if _, err := os.Stat(filepath.Join(root, "pods")); err != nil {
+		t.Errorf("an unsafe id removed the pods tree: %v", err)
 	}
 }

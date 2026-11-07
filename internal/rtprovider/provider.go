@@ -262,11 +262,26 @@ func (p *Provider) reattach(ctx context.Context, pods []*corev1.Pod) {
 		st, err := p.rt.AttachPod(withPod(ctx, pod), box)
 		if err != nil {
 			p.log.Info("re-attach refused; pod will be recreated", "pod", key(pod), "err", err)
+			p.discardPodDir(box.GetPodId())
 			continue
 		}
 		t := &tracked{pod: pod.DeepCopy(), status: st, vm: isVM(box)}
 		p.pods[box.GetPodId()] = t
 		p.log.Info("re-attached pod", "pod", key(pod))
+	}
+}
+
+// discardPodDir removes the dir of a pod whose processes did not survive a
+// restart. runtimed re-creates a pod over whatever its dir holds, and a
+// subPath file left there fails the clone with "file exists". The retry
+// after that failure already starts from an empty dir, so starting clean
+// only skips the failed attempt.
+func (p *Provider) discardPodDir(id string) {
+	if id == "" || id == "." || id == ".." || filepath.Base(id) != id {
+		return
+	}
+	if err := os.RemoveAll(filepath.Join(p.cfg.Root, "pods", id)); err != nil {
+		p.log.Warn("remove stale pod dir", "pod", id, "err", err)
 	}
 }
 
