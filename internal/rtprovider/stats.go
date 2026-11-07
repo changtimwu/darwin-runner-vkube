@@ -21,7 +21,6 @@ func (p *Provider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary,
 	}
 	now := metav1.Now()
 	sum := &statsv1alpha1.Summary{Node: statsv1alpha1.NodeStats{NodeName: p.cfg.NodeName, StartTime: now}}
-	var nodeCPU, nodeCPUTotal, nodeMem uint64
 	for _, ps := range resp.GetPodStats() {
 		p.mu.Lock()
 		t, ok := p.pods[ps.GetPodId()]
@@ -40,13 +39,16 @@ func (p *Provider) GetStatsSummary(ctx context.Context) (*statsv1alpha1.Summary,
 			})
 		}
 		sum.Pods = append(sum.Pods, pod)
-		nodeCPU += ps.GetCpu().GetUsageNanoCores()
-		nodeCPUTotal += ps.GetCpu().GetUsageCoreNanoSeconds()
-		nodeMem += ps.GetMemory().GetWorkingSetBytes()
 	}
-	// Node figures cover pods only; host-wide accounting is not wired yet.
-	sum.Node.CPU = &statsv1alpha1.CPUStats{Time: now, UsageNanoCores: &nodeCPU, UsageCoreNanoSeconds: &nodeCPUTotal}
-	sum.Node.Memory = &statsv1alpha1.MemoryStats{Time: now, WorkingSetBytes: &nodeMem}
+	// Node figures are host-wide, as the kubelet reports them. metrics-server
+	// drops a node whose CPU or memory reads 0, so pod sums are not enough.
+	h, err := p.host.Read()
+	if err != nil {
+		return nil, err
+	}
+	ht := metav1.Time{Time: h.Time}
+	sum.Node.CPU = &statsv1alpha1.CPUStats{Time: ht, UsageNanoCores: &h.CPUNanoCores, UsageCoreNanoSeconds: &h.CPUCoreNanoSeconds}
+	sum.Node.Memory = &statsv1alpha1.MemoryStats{Time: ht, WorkingSetBytes: &h.MemoryWorkingSetBytes}
 	return sum, nil
 }
 
@@ -128,5 +130,13 @@ func (p *Provider) GetMetricsResource(ctx context.Context) ([]*dto.MetricFamily,
 			add(ctrMem, float64(*cs.Memory.WorkingSetBytes), "container", cs.Name, "namespace", ns, "pod", name)
 		}
 	}
-	return []*dto.MetricFamily{nodeCPU, nodeMem, podCPU, podMem, ctrCPU, ctrMem}, nil
+	// The text encoder rejects a family with no samples, which on a node
+	// without running pods would fail the whole scrape.
+	var out []*dto.MetricFamily
+	for _, f := range []*dto.MetricFamily{nodeCPU, nodeMem, podCPU, podMem, ctrCPU, ctrMem} {
+		if len(f.Metric) > 0 {
+			out = append(out, f)
+		}
+	}
+	return out, nil
 }
