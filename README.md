@@ -70,7 +70,7 @@ The roadmap and design notes are in [issue #1](https://github.com/changtimwu/dar
 | P2 | ✅ | OCI images: `imagePullSecrets`, HTTPS and plain-HTTP registries, `ErrImagePull`/`ImagePullBackOff` with retries and events, signature policy, image GC, `mkimage` |
 | P3 | ✅ | GPU advertisement (`mlx.k3sm.io/gpu` capacity and labels), GPU memory admission, Xcode toolchain opt-in |
 | P4 | ✅ | Volumes, probes, lifecycle hooks, `OOMKilled`, QoS, node conditions, system reserve |
-| P5 | ⏳ | Linux images through the `vm` RuntimeClass; routable pod networking and cluster DNS |
+| P5 | ✅ | Linux images through the `vm` RuntimeClass; routable pod networking and cluster DNS |
 
 ## Requirements
 
