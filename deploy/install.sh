@@ -48,5 +48,7 @@ cp deploy/launchd/$LABEL.plist "$PLIST"
 for flag in "$@"; do /usr/libexec/PlistBuddy -c "Add :ProgramArguments: string $flag" "$PLIST"; done
 chown root:wheel "$PLIST"; chmod 644 "$PLIST"
 launchctl bootout system/$LABEL 2>/dev/null || true
+# bootout returns before the old daemon has exited; bootstrapping too early fails with EIO (5).
+for _ in $(seq 30); do launchctl print system/$LABEL >/dev/null 2>&1 || break; sleep 1; done
 launchctl bootstrap system "$PLIST"
 echo "started $LABEL; logs: /var/log/darwin-vk.log"
