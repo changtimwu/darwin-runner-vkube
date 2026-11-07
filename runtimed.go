@@ -56,6 +56,9 @@ func newRuntimedProvider(ctx context.Context, client kubernetes.Interface, o opt
 		return nil, err
 	}
 	root := filepath.Join(dataDir, "runtime")
+	if err := traversablePodsDir(filepath.Join(root, "pods")); err != nil {
+		return nil, err
+	}
 	return rtprovider.New(ctx, rtprovider.Config{
 		NodeName:           o.nodeName,
 		NodeIP:             ip,
@@ -154,4 +157,23 @@ func podIdentity(name string, allowRoot bool) (uint32, uint32, error) {
 		return 0, 0, fmt.Errorf("pod user %q is root; pass --allow-root-pods to accept", name)
 	}
 	return uint32(uid), uint32(gid), nil
+}
+
+// traversablePodsDir makes runtimed's pods tree reachable by the dropped pod
+// user. runtimed creates it implicitly with whichever pod comes first, and its
+// vm path uses 0750, so a root daemon whose first pod was a vm pod locked every
+// native pod out of its own rootfs. Each pod dir keeps its own mode, and the
+// Seatbelt profile still denies a pod the other pods' dirs.
+func traversablePodsDir(dir string) error {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	if fi.Mode().Perm()&0o011 != 0o011 {
+		return os.Chmod(dir, fi.Mode().Perm()|0o055)
+	}
+	return nil
 }
