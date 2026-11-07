@@ -149,6 +149,7 @@ func run(ctx context.Context, o options) error {
 	mux := http.NewServeMux()
 
 	var newProvider nodeutil.NewProviderFunc
+	var skipEnv bool
 	switch o.runtime {
 	case "process":
 		newProvider = func(cfg nodeutil.ProviderConfig) (nodeutil.Provider, node.NodeProvider, error) {
@@ -169,6 +170,9 @@ func run(ctx context.Context, o options) error {
 			configureNode(cfg.Node, ip, port, o.maxPods, o.taint, o.dataDir, "runtimed://k3sm-runtimed", o.reserved, p.GPUFacts())
 			return p, newNodeStatus(cfg.Node, o.dataDir, o.logger), nil
 		}
+		// The provider resolves env itself once it knows the pod IP;
+		// virtual-kubelet's resolver rejects status.podIP and status.hostIP.
+		skipEnv = true
 	default:
 		return fmt.Errorf("unknown --runtime %q", o.runtime)
 	}
@@ -178,6 +182,7 @@ func run(ctx context.Context, o options) error {
 		func(c *nodeutil.NodeConfig) error {
 			c.HTTPListenAddr = o.listen
 			c.InformerResyncPeriod = time.Minute
+			c.SkipDownwardAPIResolution = skipEnv
 			return nil
 		},
 	}
