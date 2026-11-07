@@ -248,7 +248,7 @@ If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays 
 - **Host networking by default.** Without `--pod-network=flannel`, the pod IP is the node IP, so two pods binding the same port conflict, and Mac pods can't use cluster DNS or ClusterIP Services.
 - **Flannel VXLAN only.** Pod networking peers with flannel's VXLAN backend. Other CNIs (Calico, Cilium, flannel's WireGuard backend) aren't supported, and NetworkPolicy isn't enforced for Mac pods.
 - **Linux images run only in VMs.** Without `runtimeClassName: vm`, a pod's image must be `darwin/arm64`.
-- **Some Linux images fail in VMs.** runtimed's guest gives containers no `/dev/fd` or `/dev/std*`, so entrypoints that use bash process substitution, such as the official `postgres` image's, exit early.
+- **Some Linux images fail in VMs.** runtimed's guest gives containers no `/dev/fd` or `/dev/std*`, so entrypoints that use bash process substitution, such as the official `postgres` image's, exit early. `examples/vm-mixed.yaml` shows how to bypass such an entrypoint.
 - **One trust domain per node.** Seatbelt limits what a pod can reach on the filesystem, but there are no separate network namespaces. Don't run mutually untrusted tenants on one Mac.
 - **No persistent volumes or hostPath** yet. Use an emptyDir for scratch space.
 - **Upgrades restart pods.** runtimed only re-attaches processes spawned by the same binary, so a new `darwin-vk` build restarts every pod.

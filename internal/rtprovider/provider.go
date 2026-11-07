@@ -254,7 +254,12 @@ func (p *Provider) reattach(ctx context.Context, pods []*corev1.Pod) {
 			p.log.Warn("re-attach: pod IP", "pod", key(pod), "err", err)
 			continue
 		}
-		box, err := p.podBoxAt(pod, ip)
+		box, err := p.podBoxAt(ctx, pod, ip)
+		if errors.As(err, new(envError)) {
+			// Keep the running processes; a later restart gets what resolves.
+			p.log.Warn("re-attach: env", "pod", key(pod), "err", err)
+			box, err = p.podBoxAt(withLenientEnv(ctx), pod, ip)
+		}
 		if err != nil {
 			p.log.Warn("re-attach: translate", "pod", key(pod), "err", err)
 			continue
@@ -308,7 +313,13 @@ func (p *Provider) CreatePod(ctx context.Context, pod *corev1.Pod) error {
 		p.event(pod, corev1.EventTypeWarning, "FailedCreatePodSandBox", "pod network: %s", err)
 		return fmt.Errorf("create pod %s: %w", key(pod), err)
 	}
-	box, err := p.podBoxAt(pod, ip)
+	box, err := p.podBoxAt(ctx, pod, ip)
+	if errors.As(err, new(envError)) {
+		// Like the kubelet's CreateContainerConfigError: stay Pending and
+		// retry, as a missing ConfigMap or Secret may appear later.
+		p.event(pod, corev1.EventTypeWarning, "Failed", "Error: %s", err)
+		return fmt.Errorf("create pod %s: %w", key(pod), err)
+	}
 	if err != nil {
 		p.reject(t, err)
 		return nil

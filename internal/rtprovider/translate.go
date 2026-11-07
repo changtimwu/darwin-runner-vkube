@@ -1,6 +1,7 @@
 package rtprovider
 
 import (
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -19,13 +20,13 @@ const nativeImage = "native"
 
 // podBox translates a Pod on the node IP into runtimed's PodBox.
 func (p *Provider) podBox(pod *corev1.Pod) (*runtimev1.PodBox, error) {
-	return p.podBoxAt(pod, p.cfg.NodeIP)
+	return p.podBoxAt(context.Background(), pod, p.cfg.NodeIP)
 }
 
 // podBoxAt translates a Pod with IP podIP into runtimed's PodBox. It must be
 // deterministic: re-attach verifies the compiled sandbox profile against the
-// original spawn.
-func (p *Provider) podBoxAt(pod *corev1.Pod, podIP string) (*runtimev1.PodBox, error) {
+// original spawn. An envError means the env's sources are not readable yet.
+func (p *Provider) podBoxAt(ctx context.Context, pod *corev1.Pod, podIP string) (*runtimev1.PodBox, error) {
 	id := string(pod.UID)
 	if id == "" {
 		return nil, fmt.Errorf("pod %s has no UID", key(pod))
@@ -107,6 +108,9 @@ func (p *Provider) podBoxAt(pod *corev1.Pod, podIP string) (*runtimev1.PodBox, e
 	if box.Containers, err = toContainers(pod.Spec.Containers); err != nil {
 		return nil, err
 	}
+	if err := p.setEnv(ctx, pod, podIP, box); err != nil {
+		return nil, err
+	}
 	if backend != runtimev1.SandboxBackend_SANDBOX_BACKEND_VM {
 		p.addNetworkEnv(box, pod, podIP)
 	}
@@ -143,10 +147,7 @@ func toContainers(cs []corev1.Container) ([]*runtimev1.Container, error) {
 				rc.Command = append([]string{path}, rc.Command[1:]...)
 			}
 		}
-		for _, e := range c.Env {
-			// virtual-kubelet has already resolved valueFrom into value.
-			rc.Env = append(rc.Env, &runtimev1.EnvVar{Name: e.Name, Value: e.Value})
-		}
+		// Env is filled in by setEnv, once the pod IP is known.
 		for _, port := range c.Ports {
 			rc.Ports = append(rc.Ports, &runtimev1.ContainerPort{Name: port.Name, ContainerPort: port.ContainerPort, Protocol: string(port.Protocol)})
 		}
