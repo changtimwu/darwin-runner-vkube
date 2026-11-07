@@ -55,7 +55,7 @@ flowchart LR
 | Probes and hooks | Liveness, readiness and startup probes (exec, HTTP, TCP, gRPC); `postStart` and `preStop` hooks |
 | Memory limits | Enforced; a container over its limit is `OOMKilled` |
 | Node conditions | `MemoryPressure`, `DiskPressure` and `PIDPressure` from the Mac; `--system-reserved` keeps memory for macOS |
-| Pod IP | The node IP (host network) |
+| Pod IP | The node IP by default. With `--pod-network=flannel`, each pod's own IP from the node's podCIDR, routed over the cluster's flannel network, with ClusterIP Services and cluster DNS. See [Pod networking](#pod-networking). |
 | Daemon restart | Running pods are re-attached rather than restarted |
 
 ## Status
@@ -108,6 +108,8 @@ kubectl apply -f deploy/rbac.yaml deploy/runtimeclass.yaml
 sudo deploy/install.sh darwin-vk.kubeconfig cluster-ca.crt --node-ip <mac-ip>
 sudo deploy/install.sh --uninstall
 ```
+
+Add `--pod-network flannel` to give pods their own IPs on a flannel cluster (see [Pod networking](#pod-networking)).
 
 **4. Try it:**
 
@@ -169,13 +171,23 @@ There is no chroot. runtimed writes each volume into the pod's own directory, an
 
 **Resources.** A container over its memory limit is killed with `OOMKilled`. Memory is sampled, not capped, so a fast allocator can overshoot the limit briefly before it is killed. CPU limits aren't enforced. The node holds back `--system-reserved` (2 GiB of memory by default) from what it offers pods, for macOS and anything else running on the Mac. It reports `MemoryPressure` when macOS reaches critical memory pressure (the routine "warning" level is ignored), `DiskPressure` below 5 GiB free on the data volume, and `PIDPressure` above 90% of the process limit.
 
+## Pod networking
+
+By default every Mac pod shares the node IP. With `--pod-network=flannel` (root only), each pod gets its own IP and the Mac joins the cluster's pod network:
+
+- **Routing:** the Mac becomes a peer of the cluster's [flannel](https://github.com/flannel-io/flannel) VXLAN network, the k3s default. darwin-vk publishes the node annotations flannel peers from, so the Linux nodes route the Mac's podCIDR to it with no cluster-side change. The Mac answers with a userspace VXLAN endpoint on a utun. Nodes must reach each other on UDP **8472**. Like flannel's own VXLAN backend, the traffic is not encrypted.
+- **Native pods:** each one gets a `/32` from the node's podCIDR as an `lo0` alias. A DYLD library from k3sm's [darwin-net](https://github.com/k3sm-io/darwin-net) binds the pod's wildcard listeners to that IP, so two pods can use the same port, and resolves cluster names through cluster DNS.
+- **Services:** darwin-net's userspace Service proxy owns every ClusterIP on `lo0`, so Mac pods reach Services (and `kube-dns`) by name or IP. Linux pods reach Mac pods through their own kube-proxy, as with any other node.
+- **Linux pods (`vm`):** the pod's IP lives on `lo0`, and the proxy relays its ports to the guest. The guest resolves through cluster DNS and reaches Services, but it can't reach other nodes' pod IPs directly: its own traffic leaves through macOS's NAT.
+- **Settings:** `--cluster-cidr` and `--service-cidr` default to k3s's `10.42.0.0/16` and `10.43.0.0/16`. The node needs a `spec.podCIDR` (a `/24`), which the controller manager assigns.
+
 ## Linux pods (`vm` RuntimeClass)
 
 A pod with `runtimeClassName: vm` runs a `linux/arm64` image in its own Virtualization.framework micro-VM, using runtimed's vm backend. Apply `deploy/runtimeclass.yaml` once; its scheduling stanza sends these pods to Mac nodes, so they need no node selector of their own. See `examples/vm-mixed.yaml`, which pairs a Postgres VM with a native GPU job.
 
 - **Size:** CPU limits set the vCPU count (rounded up) and the memory limit sets the guest's RAM. Without limits, runtimed picks a default.
 - **Guest kernel:** at startup darwin-vk downloads runtimed's pinned kernel and initramfs into the data dir and verifies their digests. It also needs `k3sm-vmhost`, signed with the virtualization entitlement, beside the binary (`make build` and `deploy/install.sh` handle both). If any of this is missing, `vm` pods are rejected with a reason and native pods are unaffected. `--disable-vm` turns it off.
-- **Networking:** the guest sits on macOS's private NAT network. The pod reports the node IP, and darwin-vk forwards each declared TCP `containerPort` from the node to the guest, so Services and other Mac pods reach it at `<node IP>:<port>`. Probes connect to the guest directly.
+- **Networking:** the guest sits on macOS's private NAT network. With `--pod-network=flannel` the pod gets its own IP (see [Pod networking](#pod-networking)). Otherwise it reports the node IP, and darwin-vk forwards each declared TCP `containerPort` from the node to the guest, so Services and other Mac pods reach it at `<node IP>:<port>`. Probes connect to the guest directly.
 - **Not available in VMs:** the GPU, which Virtualization.framework can't pass to Linux guests, and `fsGroup`.
 - **Local Network privacy:** macOS blocks self-built binaries from LAN addresses, including the VMs' network, unless an app approved the access. The root LaunchDaemon is exempt. A dev build started from a terminal needs that terminal app's Local Network permission. Under tmux there's no app to ask, so probes and forwarded ports fail with `no route to host`.
 
@@ -223,12 +235,18 @@ A GPU pod must set a memory limit on every container. The node adds up the limit
 | `--system-reserved` | `memory=2Gi` | Resources held back from pods, e.g. `cpu=1,memory=4Gi` |
 | `--shadow-bin-dir` | | Root-owned directory of re-signed shells and tools, so shell pods see their volumes. `deploy/install.sh` creates and sets it. |
 | `--taint` | true | Add the NoSchedule taint |
+| `--pod-network` | `none` | `none` (pods share the node IP) or `flannel` (own pod IPs on the cluster's flannel VXLAN network; root only) |
+| `--cluster-cidr` / `--service-cidr` | `10.42.0.0/16` / `10.43.0.0/16` | The cluster's pod and Service ranges |
+| `--cluster-domain` | `cluster.local` | The cluster's DNS domain |
+| `--vm-subnet` | `192.168.64.0/24` | macOS's vmnet segment, which `vm` guests lease from |
+| `--vxlan-endpoint` | | `public-ip=host:port`: send a peer's VXLAN traffic elsewhere. For test setups such as k3s in Docker Desktop, where the Mac can't reach the container. Repeatable. |
 
 If neither `--client-ca` nor `--insecure-no-auth` is set, the kubelet API stays off. Pods still run, but `logs`, `exec` and `port-forward` are unavailable.
 
 ## Limitations
 
-- **Host networking.** The pod IP is the node IP, so two pods binding the same port conflict. Cluster DNS and ClusterIP Services aren't reachable from Mac pods yet (P5).
+- **Host networking by default.** Without `--pod-network=flannel`, the pod IP is the node IP, so two pods binding the same port conflict, and Mac pods can't use cluster DNS or ClusterIP Services.
+- **Flannel VXLAN only.** Pod networking peers with flannel's VXLAN backend. Other CNIs (Calico, Cilium, flannel's WireGuard backend) aren't supported, and NetworkPolicy isn't enforced for Mac pods.
 - **Linux images run only in VMs.** Without `runtimeClassName: vm`, a pod's image must be `darwin/arm64`.
 - **Some Linux images fail in VMs.** runtimed's guest gives containers no `/dev/fd` or `/dev/std*`, so entrypoints that use bash process substitution, such as the official `postgres` image's, exit early.
 - **One trust domain per node.** Seatbelt limits what a pod can reach on the filesystem, but there are no separate network namespaces. Don't run mutually untrusted tenants on one Mac.
